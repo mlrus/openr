@@ -16,6 +16,9 @@
 #include <openr/common/Constants.h>
 #include <openr/common/Util.h>
 
+using namespace std::chrono_literals;
+using namespace std::chrono;
+
 namespace openr {
 
 KvStore::KvStore(
@@ -49,20 +52,24 @@ KvStore::KvStore(
       peers_(std::move(peers)),
       // initialize zmq sockets
       localPubSock_{zmqContext},
-      peerSubSock_{zmqContext,
-                   fbzmq::IdentityString{folly::sformat(
-                       Constants::kGlobalSubIdTemplate, nodeId_)},
-                   keyPair},
-      localCmdSock_{zmqContext,
-                    fbzmq::IdentityString{folly::sformat(
-                        Constants::kLocalCmdIdTemplate, nodeId_)},
-                    keyPair,
-                    fbzmq::NonblockingFlag{true}},
-      peerSyncSock_{zmqContext,
-                    fbzmq::IdentityString{folly::sformat(
-                        Constants::kPeerSyncIdTemplate, nodeId_)},
-                    keyPair,
-                    fbzmq::NonblockingFlag{true}} {
+      peerSubSock_(
+          zmqContext,
+          fbzmq::IdentityString{folly::sformat(
+              Constants::kGlobalSubIdTemplate, nodeId_)},
+          keyPair,
+          fbzmq::NonblockingFlag{true}),
+      localCmdSock_(
+          zmqContext,
+          fbzmq::IdentityString{folly::sformat(
+              Constants::kLocalCmdIdTemplate, nodeId_)},
+          keyPair,
+          fbzmq::NonblockingFlag{true}),
+      peerSyncSock_(
+          zmqContext,
+          fbzmq::IdentityString{folly::sformat(
+              Constants::kPeerSyncIdTemplate, nodeId_)},
+          keyPair,
+          fbzmq::NonblockingFlag{true}) {
   CHECK(not nodeId_.empty());
   CHECK(not localPubUrl_.empty());
   CHECK(not globalPubUrl_.empty());
@@ -230,6 +237,12 @@ KvStore::KvStore(
       LOG(FATAL) << "Error setting ZMQ_TOS to " << ipTos << " "
                  << peerSyncTos.error();
     }
+    const auto peerSubTos =
+        peerSubSock_.setSockOpt(ZMQ_TOS, &ipTos, sizeof(int));
+    if (peerSubTos.hasError()) {
+      LOG(FATAL) << "Error setting ZMQ_TOS to " << ipTos << " "
+                 << peerSubTos.error();
+    }
   }
 
   //
@@ -305,6 +318,9 @@ KvStore::mergeKeyValues(
   // the publication to build if we update our KV store
   thrift::Publication thriftPub{};
 
+  // Counters for logging
+  uint32_t ttlUpdateCnt{0}, valUpdateCnt{0};
+
   for (const auto& kv : keyVals) {
     auto const& key = kv.first;
     auto const& value = kv.second;
@@ -313,6 +329,12 @@ KvStore::mergeKeyValues(
     // we would be beaten by any version supplied by the setter
     int64_t myVersion{0};
     int64_t newVersion = value.version;
+
+    // Check if TTL is valid. It must be infinite or positive number
+    // Skip if invalid!
+    if (value.ttl != Constants::kTtlInfinity && value.ttl <= 0) {
+      continue;
+    }
 
     // if key exist, compare values first
     // if they are the same, no need to propagate changes
@@ -393,6 +415,7 @@ KvStore::mergeKeyValues(
     VLOG(4) << "(mergeKeyValues) Inserting/Updating key: '" << key << "'";
 
     if (updateAllNeeded) {
+      ++valUpdateCnt;
       //
       // update everything for such key
       //
@@ -409,9 +432,11 @@ KvStore::mergeKeyValues(
       }
       // update hash if it's not there
       if (not kvStoreIt->second.hash.hasValue()) {
-        kvStoreIt->second.hash = value.hash;
+        kvStoreIt->second.hash = generateHash(
+            value.version, value.originatorId, value.value);
       }
     } else if (updateTtlNeeded) {
+      ++ttlUpdateCnt;
       //
       // update ttl,ttlVersion only
       //
@@ -426,6 +451,9 @@ KvStore::mergeKeyValues(
     thriftPub.keyVals.emplace(key, value);
   }
 
+  VLOG(4) << "(mergeKeyValues) updating " << thriftPub.keyVals.size()
+          << " keyvals. ValueUpdates: " << valUpdateCnt
+          << ", TtlUpdates: " << ttlUpdateCnt;
   return thriftPub;
 }
 
@@ -493,7 +521,7 @@ KvStore::processPublication() {
   // If the following publication is not empty, means we received some
   // new information and we haven't processed this publication before.
   // If so, relay it, else stop
-  auto deltaPub = mergeKeyValues(kvStore_, thriftPub.keyVals);
+  const auto deltaPub = mergeKeyValues(kvStore_, thriftPub.keyVals);
   updateTtlCountdownQueue(deltaPub);
   tData_.addStatValue(
       "kvstore.updated_key_vals", deltaPub.keyVals.size(), fbzmq::SUM);
@@ -515,8 +543,6 @@ KvStore::processPublication() {
 thrift::Publication
 KvStore::getKeyVals(std::vector<std::string> const& keys) {
   thrift::Publication thriftPub;
-
-  DCHECK(!keys.empty()) << "getKeyVals with empty key vector";
 
   for (auto const& key : keys) {
     // if requested key if found, respond with version and value
@@ -553,7 +579,7 @@ KvStore::dumpHashWithPrefix(std::string const& prefix) const {
     if (kv.first.compare(0, prefix.length(), prefix) != 0) {
       continue;
     }
-    CHECK(kv.second.hash.hasValue());
+    DCHECK(kv.second.hash.hasValue());
     auto& value = thriftPub.keyVals[kv.first];
     value.version = kv.second.version;
     value.originatorId = kv.second.originatorId;
@@ -562,6 +588,34 @@ KvStore::dumpHashWithPrefix(std::string const& prefix) const {
     value.ttlVersion = kv.second.ttlVersion;
   }
   return thriftPub;
+}
+
+// dump the keys on which hashes differ from given keyVals
+thrift::Publication
+KvStore::dumpDifference(
+  std::unordered_map<std::string, thrift::Value> const& keyValHashes) const {
+    thrift::Publication thriftPub;
+    for (const auto& kv : kvStore_) {
+      auto const& key = kv.first;
+      auto const& value = kv.second;
+
+      // if key doesn't exist, add it in Publication response to provide
+      // keyVals for peers to process sync
+      auto kvStoreIt = keyValHashes.find(key);
+      if (kvStoreIt == keyValHashes.end()) {
+        thriftPub.keyVals.emplace(key, value);
+        continue;
+      }
+      if (kvStoreIt->second.hash != value.hash ||
+        kvStoreIt->second.version != value.version ||
+        kvStoreIt->second.originatorId != value.originatorId ||
+        kvStoreIt->second.ttlVersion != value.ttlVersion) {
+          // check for version and originatorId as 2nd check just in case if
+          // hash happens to be colliding
+          thriftPub.keyVals.emplace(key, value);
+      }
+    }
+    return thriftPub;
 }
 
 // add new peers to subscribe to
@@ -665,8 +719,9 @@ KvStore::addPeers(
     }
   }
 
-  // Request immediate full sync from peers after adding peers
-  requestFullSyncFromPeers();
+  // Request full sync from peers after adding peers in kInitialBackoff. Trying
+  // immediately leads to failure as TCP sockets might not have been setup yet.
+  fullSyncTimer_->scheduleTimeout(Constants::kInitialBackoff);
 }
 
 // delete some peers we are subscribed to
@@ -724,9 +779,12 @@ KvStore::requestFullSyncFromPeers() {
 
     thrift::Request dumpRequest;
     dumpRequest.cmd = thrift::Command::KEY_DUMP;
-
+    dumpRequest.keyDumpParams.keyValHashes =
+      std::move(dumpHashWithPrefix("").keyVals);
     VLOG(1) << "Sending full sync request to peer " << peerName << " using id "
             << peerCmdSocketId;
+    latestSentPeerSync_.emplace(
+      peerCmdSocketId, std::chrono::steady_clock::now());
 
     auto const ret = peerSyncSock_.sendMultiple(
         fbzmq::Message::from(peerCmdSocketId).value(),
@@ -739,6 +797,7 @@ KvStore::requestFullSyncFromPeers() {
               << " using id " << peerCmdSocketId << " (will try again). "
               << ret.error();
       expBackoff.reportError(); // Apply exponential backoff
+      timeout = std::min(timeout, expBackoff.getTimeRemainingUntilRetry());
       ++it;
     } else {
       // Remove the iterator
@@ -750,7 +809,8 @@ KvStore::requestFullSyncFromPeers() {
   // there
   // are still some peers to sync with.
   if (not peersToSyncWith_.empty()) {
-    VLOG(5) << peersToSyncWith_.size() << " peers still require sync.";
+    LOG(WARNING) << peersToSyncWith_.size() << " peers still require sync."
+                 << "Scheduling retry after " << timeout.count() << "ms.";
     // schedule next timeout
     fullSyncTimer_->scheduleTimeout(timeout);
   }
@@ -820,12 +880,7 @@ KvStore::processRequest(
     VLOG(3) << "Set key requested";
     tData_.addStatValue("kvstore.cmd_key_set", 1, fbzmq::COUNT);
 
-    // to catch the issues in unittests
-    DCHECK(!thriftReq.keySetParams.keyVals.empty());
-    DCHECK(thriftReq.keyGetParams.keys.empty());
-
-    if (thriftReq.keySetParams.keyVals.empty() ||
-        !thriftReq.keyGetParams.keys.empty()) {
+    if (thriftReq.keySetParams.keyVals.empty()) {
       LOG(ERROR) << "Malformed set request, ignoring";
       cmdSock.sendOne(fbzmq::Message::from(Constants::kErrorResponse).value());
       return;
@@ -843,9 +898,11 @@ KvStore::processRequest(
 
     const auto thriftPub = mergeKeyValues(kvStore_, keyVals);
     updateTtlCountdownQueue(thriftPub);
+    tData_.addStatValue(
+        "kvstore.updated_key_vals", thriftPub.keyVals.size(), fbzmq::SUM);
 
     // publish the updated key-values to the peers
-    if (!keyVals.empty()) {
+    if (!thriftPub.keyVals.empty()) {
       VLOG(3) << "Publishing KV update to the peers after SET command";
       auto const msg =
           fbzmq::Message::fromThriftObj(thriftPub, serializer_).value();
@@ -863,29 +920,26 @@ KvStore::processRequest(
     VLOG(3) << "Get key-values requested";
     tData_.addStatValue("kvstore.cmd_key_get", 1, fbzmq::COUNT);
 
-    // to catch the issues in unittests
-    DCHECK(!thriftReq.keyGetParams.keys.empty());
-    DCHECK(thriftReq.keySetParams.keyVals.empty());
-
-    if (thriftReq.keyGetParams.keys.empty() ||
-        !thriftReq.keySetParams.keyVals.empty()) {
-      LOG(ERROR) << "Malformed GET request, ignoring";
-      cmdSock.sendOne(
-          fbzmq::Message::fromThriftObj(thrift::Publication{}, serializer_)
-              .value());
-      return;
-    }
-
     const auto thriftPub = getKeyVals(thriftReq.keyGetParams.keys);
     cmdSock.sendOne(
         fbzmq::Message::fromThriftObj(thriftPub, serializer_).value());
     break;
   }
   case thrift::Command::KEY_DUMP: {
-    VLOG(3) << "Dump all keys requested";
+    if (thriftReq.keyDumpParams.keyValHashes.hasValue()) {
+      VLOG(3) << "Dump keys requested along with "
+              << thriftReq.keyDumpParams.keyValHashes.value().size()
+              << " keyValHashes item(s) provided from peer";
+    } else {
+      VLOG(3) << "Dump all keys requested";
+    }
+
     tData_.addStatValue("kvstore.cmd_key_dump", 1, fbzmq::COUNT);
 
-    const auto thriftPub = dumpAllWithPrefix(thriftReq.keyDumpParams.prefix);
+    const auto thriftPub =
+        (thriftReq.keyDumpParams.keyValHashes.hasValue())
+        ? dumpDifference(thriftReq.keyDumpParams.keyValHashes.value())
+        : dumpAllWithPrefix(thriftReq.keyDumpParams.prefix);
     const auto retPub = cmdSock.sendOne(
         fbzmq::Message::fromThriftObj(thriftPub, serializer_).value());
     if (retPub.hasError()) {
@@ -971,11 +1025,14 @@ KvStore::processSyncResponse() noexcept {
   auto syncPub =
       syncPubMsg.readThriftObj<thrift::Publication>(serializer_).value();
 
-  VLOG(1) << "Sync response received from " << requestId << " with "
-          << syncPub.keyVals.size() << " key value pairs";
-
-  auto deltaPub = mergeKeyValues(kvStore_, syncPub.keyVals);
+  const auto deltaPub = mergeKeyValues(kvStore_, syncPub.keyVals);
   updateTtlCountdownQueue(deltaPub);
+  tData_.addStatValue(
+      "kvstore.updated_key_vals", deltaPub.keyVals.size(), fbzmq::SUM);
+
+  VLOG(1) << "Sync response received from " << requestId << " with "
+          << syncPub.keyVals.size() << " key value pairs which incured "
+          << deltaPub.keyVals.size() << " key-value updates";
 
   // publish the updated key-values to the peers
   if (!deltaPub.keyVals.empty()) {
@@ -986,6 +1043,20 @@ KvStore::processSyncResponse() noexcept {
     globalPubSock_.sendOne(msg);
   } else {
     VLOG(3) << "No new values to publish to clients/peers...";
+  }
+
+  if (latestSentPeerSync_.count(requestId)) {
+    tData_.addStatValue(
+        folly::sformat("kvstore.sync_time_{}", requestId),
+        duration_cast<milliseconds>(
+            steady_clock::now() - latestSentPeerSync_.at(requestId)).count(),
+        fbzmq::AVG);
+    VLOG(1) << "It takes "
+            << duration_cast<milliseconds>(
+                   steady_clock::now() - latestSentPeerSync_.at(requestId))
+                   .count()
+            << " ms to fully synced with " << requestId;
+    latestSentPeerSync_.erase(requestId);
   }
 }
 
@@ -1101,7 +1172,7 @@ KvStore::countdownTtl() {
         it->second.ttlVersion == top.ttlVersion) {
       expiredKeys.push_back(top.key);
       kvStore_.erase(it);
-      VLOG(1) << "Delete expired key: " << top.key;
+      LOG(WARNING) << "Delete expired key: " << top.key;
       logKvEvent("KEY_EXPIRE", top.key);
     }
     ttlCountdownQueue_.pop();
@@ -1133,7 +1204,7 @@ KvStore::getPrefixCount() {
   int count = 0;
   for (auto const& kv : kvStore_) {
     auto const& key = kv.first;
-    if (key.find("prefix::") == 0) {
+    if (key.find(Constants::kPrefixDbMarker) == 0) {
       ++count;
     }
   }
@@ -1142,7 +1213,7 @@ KvStore::getPrefixCount() {
 
 void
 KvStore::submitCounters() {
-  VLOG(2) << "Submitting counters ... ";
+  VLOG(3) << "Submitting counters ... ";
 
   // Extract/build counters from thread-data
   auto counters = tData_.getCounters();
@@ -1152,6 +1223,9 @@ KvStore::submitCounters() {
   counters["kvstore.num_peers"] = peers_.size();
   counters["kvstore.num_prefixes"] = getPrefixCount();
   counters["kvstore.pending_full_sync"] = peersToSyncWith_.size();
+
+  // Aliveness report counters
+  counters["kvstore.aliveness"] = 1;
 
   // Prepare for submitting counters
   fbzmq::CounterMap submittingCounters = prepareSubmitCounters(counters);

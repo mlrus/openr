@@ -206,6 +206,7 @@ class FBCodeBuilder(object):
                 'libtool '
                 'netcat-openbsd '
                 'pkg-config '
+                'sudo '
                 'unzip '
                 'wget'
             )),
@@ -245,6 +246,15 @@ class FBCodeBuilder(object):
                 'apt-get upgrade -yq cmake'
             )))
 
+        # Debian 8.6 comes with a CMake version that is too old for folly.
+        if self.option('os_image') == 'debian:8.6':
+            actions.append(self.run(ShellQuoted(
+                'echo deb http://ftp.debian.org/debian jessie-backports main '
+                '>> /etc/apt/sources.list.d/jessie-backports.list && '
+                'apt-get update && '
+                'apt-get -yq -t jessie-backports install cmake'
+            )))
+
         actions.extend(self.debian_ccache_setup_steps())
 
         return self.step('Install packages for Debian-based OS', actions)
@@ -266,15 +276,6 @@ class FBCodeBuilder(object):
         ] if git_hash else []
 
         base_dir = self.option('projects_dir')
-        git_patch = self.option('{0}:git_patch'.format(project), '')
-        patch_file = path_join(
-            base_dir,
-            '../shipit_projects' if self.has_option('shipit_project_dir') else '',
-            git_patch
-        )
-        maybe_apply_patch = [
-            self.run(ShellQuoted('git apply {p}').format(p=patch_file)),
-        ] if git_patch else []
 
         local_repo_dir = self.option('{0}:local_repo_dir'.format(project), '')
         return self.step('Check out {0}, workdir {1}'.format(project, path), [
@@ -285,7 +286,7 @@ class FBCodeBuilder(object):
                 local_repo_dir, os.path.basename(project)
             ),
             self.workdir(path_join(base_dir, os.path.basename(project), path)),
-        ] + maybe_change_branch + maybe_apply_patch)
+        ] + maybe_change_branch)
 
     def fb_github_project_workdir(self, project_and_path, github_org='facebook'):
         'This helper lets Facebook-internal CI special-cases FB projects'

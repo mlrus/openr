@@ -68,7 +68,7 @@ class LinkMonitor final : public fbzmq::ZmqEventLoop {
       // interface names to exclude
       std::vector<std::regex> const& excludeRegexList,
       // interface names to advertise their addresses
-      std::set<std::string> const& redistIfNames,
+      std::vector<std::regex> const& redistRegexList,
       // static list of prefixes to announce
       std::vector<thrift::IpPrefix> const& staticPrefixes,
       // measure and use RTT of adjacencies for link
@@ -80,6 +80,10 @@ class LinkMonitor final : public fbzmq::ZmqEventLoop {
       bool enablePerfMeasurement,
       // is v4 enabled or not
       bool enableV4,
+      // enable interface db
+      bool advertiseInterfaceDb,
+      // enable segment routing
+      bool enableSegmentRouting,
       // KvStore's adjacency object's key prefix
       AdjacencyDbMarker adjacencyDbMarker,
       InterfaceDbMarker interfaceDbMarker,
@@ -212,6 +216,9 @@ class LinkMonitor final : public fbzmq::ZmqEventLoop {
   // Sumbmits the counter/stats to monitor
   void submitCounters();
 
+  // helper to check if ifName has a prefix match in redistIfNames_
+  bool checkRedistIfNameRegex(const std::string& ifName);
+
   // submit events to monitor
   void logEvent(
       const std::string& event,
@@ -240,8 +247,8 @@ class LinkMonitor final : public fbzmq::ZmqEventLoop {
   const std::vector<std::regex> includeRegexList_;
   // the interface names that match we can't run on
   const std::vector<std::regex> excludeRegexList_;
-  // the interface names for advertising their global addresses
-  const std::set<std::string> redistIfNames_;
+  // the interface names regex for advertising their global addresses
+  const std::vector<std::regex> redistRegexList_;
   // static list of prefixes to announce
   const std::vector<thrift::IpPrefix> staticPrefixes_;
   // Use spark measured RTT to neighbor as link metric
@@ -252,6 +259,10 @@ class LinkMonitor final : public fbzmq::ZmqEventLoop {
   const bool enablePerfMeasurement_{false};
   // is v4 enabled in OpenR or not
   const bool enableV4_{false};
+  // advertise interface DB or not
+  const bool advertiseInterfaceDb_{false};
+  // enable segment routing
+  const bool enableSegmentRouting_{false};
   // used to match the adjacency database keys
   const std::string adjacencyDbMarker_;
   // used to encode interface database key names

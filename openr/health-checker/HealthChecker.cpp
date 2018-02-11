@@ -25,6 +25,7 @@ HealthChecker::HealthChecker(
     uint32_t healthCheckPct,
     uint16_t udpPingPort,
     std::chrono::seconds pingInterval,
+    folly::Optional<int> maybeIpTos,
     const AdjacencyDbMarker& adjacencyDbMarker,
     const PrefixDbMarker& prefixDbMarker,
     const KvStoreLocalCmdUrl& storeCmdUrl,
@@ -39,7 +40,8 @@ HealthChecker::HealthChecker(
       pingInterval_(pingInterval),
       adjacencyDbMarker_(adjacencyDbMarker),
       prefixDbMarker_(prefixDbMarker),
-      repSock_{zmqContext} {
+      repSock_(
+          zmqContext, folly::none, folly::none, fbzmq::NonblockingFlag{true}) {
   // Sanity check on healthCheckPct validation
   if (healthCheckPct_ > 100) {
     LOG(FATAL) << "Invalid healthCheckPct value: " << healthCheckPct_
@@ -58,11 +60,13 @@ HealthChecker::HealthChecker(
   }
 
   // Initialize sockets in event loop
-  scheduleTimeout(std::chrono::seconds(0), [this]() noexcept { prepare(); });
+  scheduleTimeout(
+      std::chrono::seconds(0),
+      [this, maybeIpTos]() noexcept { prepare(maybeIpTos); });
 }
 
 void
-HealthChecker::prepare() noexcept {
+HealthChecker::prepare(folly::Optional<int> maybeIpTos) noexcept {
   // get a dump from kvStore and set callback to process all future publications
 
   const auto adjMap = kvStoreClient_->dumpAllWithPrefix(adjacencyDbMarker_);
@@ -96,6 +100,16 @@ HealthChecker::prepare() noexcept {
       0) {
     LOG(FATAL) << "Failed making the socket v6 only: "
                << folly::errnoStr(errno);
+  }
+  // Set ip-tos
+  if (maybeIpTos) {
+    const int ipTos = *maybeIpTos;
+    if (::setsockopt(
+            pingSocketFd_, IPPROTO_IPV6, IPV6_TCLASS,
+            &ipTos, sizeof(int)) != 0) {
+      LOG(FATAL) << "Failed setting ip-tos value on socket. Error: "
+                 << folly::errnoStr(errno);
+    }
   }
   const auto pingSockAddr =
       folly::SocketAddress(folly::IPAddress("::"), udpPingPort_);
@@ -369,7 +383,7 @@ HealthChecker::processMessage() {
 void
 HealthChecker::processRequest() {
   auto maybeThriftReq = repSock_.recvThriftObj<thrift::HealthCheckerRequest>(
-      serializer_, Constants::kReadTimeout);
+      serializer_);
   if (maybeThriftReq.hasError()) {
     LOG(ERROR) << "HealthChecker: Error processing request on REP socket: "
                << maybeThriftReq.error();
@@ -418,13 +432,16 @@ HealthChecker::printInfo() {
 
 void
 HealthChecker::submitCounters() {
-  VLOG(2) << "Submitting counters...";
+  VLOG(3) << "Submitting counters...";
 
   // Extract/build counters from thread-data
   auto counters = tData_.getCounters();
 
   counters["health_checker.nodes_to_ping_size"] = nodesToPing_.size();
   counters["health_checker.nodes_info_size"] = nodeInfo_.size();
+
+  // Aliveness report counters
+  counters["health_checker.aliveness"] = 1;
 
   // Prepare for submitting counters
   fbzmq::CounterMap submittingCounters = prepareSubmitCounters(counters);

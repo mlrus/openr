@@ -13,13 +13,12 @@ from __future__ import division
 from fbzmq.Monitor import ttypes as monitor_types
 from openr.utils import socket, consts
 
-from thrift.protocol.TCompactProtocol import TCompactProtocolFactory
 import zmq
 
 
 class MonitorClient():
     def __init__(self, zmq_ctx, monitor_cmd_url, timeout=consts.Consts.TIMEOUT_MS,
-                 proto_factory=TCompactProtocolFactory):
+                 proto_factory=consts.Consts.PROTO_FACTORY):
         self._monitor_cmd_socket = socket.Socket(zmq_ctx, zmq.DEALER, timeout,
                                                   proto_factory)
         self._monitor_cmd_socket.connect(monitor_cmd_url)
@@ -32,3 +31,13 @@ class MonitorClient():
         self._monitor_cmd_socket.send_thrift_obj(request)
         return self._monitor_cmd_socket.recv_thrift_obj(
             monitor_types.CounterValuesResponse)
+
+    def dump_log_data(self):
+
+        request = monitor_types.MonitorRequest()
+        request.cmd = monitor_types.MonitorCommand.GET_EVENT_LOGS
+
+        self._monitor_cmd_socket.send_thrift_obj(request)
+
+        return self._monitor_cmd_socket.recv_thrift_obj(
+            monitor_types.EventLogsResponse)

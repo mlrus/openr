@@ -21,15 +21,12 @@
 
 namespace openr {
 
-const int kConvergenceMax{2000};
-
 Fib::Fib(
     std::string myNodeName,
     int32_t thriftPort,
     bool dryrun,
     std::chrono::seconds coldStartDuration,
     const DecisionPubUrl& decisionPubUrl,
-    const DecisionCmdUrl& decisionRepUrl,
     const FibCmdUrl& fibRepUrl,
     const LinkMonitorGlobalPubUrl& linkMonPubUrl,
     const MonitorSubmitUrl& monitorSubmitUrl,
@@ -37,12 +34,14 @@ Fib::Fib(
     : myNodeName_(std::move(myNodeName)),
       thriftPort_(thriftPort),
       dryrun_(dryrun),
-      decisionSub_(zmqContext),
-      decisionReq_(zmqContext),
-      fibRep_(zmqContext),
-      linkMonSub_(zmqContext),
+      coldStartDuration_(coldStartDuration),
+      decisionSub_(
+          zmqContext, folly::none, folly::none, fbzmq::NonblockingFlag{true}),
+      fibRep_(
+          zmqContext, folly::none, folly::none, fbzmq::NonblockingFlag{true}),
+      linkMonSub_(
+          zmqContext, folly::none, folly::none, fbzmq::NonblockingFlag{true}),
       decisionPubUrl_(std::move(decisionPubUrl)),
-      decisionRepUrl_(std::move(decisionRepUrl)),
       fibRepUrl_(std::move(fibRepUrl)),
       linkMonPubUrl_(std::move(linkMonPubUrl)),
       expBackoff_(
@@ -59,13 +58,15 @@ Fib::Fib(
     }
   });
 
-  syncRoutesTimer_->scheduleTimeout(coldStartDuration);
+  syncRoutesTimer_->scheduleTimeout(coldStartDuration_);
 
   healthChecker_ = fbzmq::ZmqTimeout::make(this, [this]() noexcept {
     // Make thrift calls to do real programming
     try {
       keepAliveCheck();
     } catch (const std::exception& e) {
+      tData_.addStatValue("fib.thrift.failure.keepalive", 1, fbzmq::COUNT);
+      agentRoutes_.clear();
       client_.reset();
       LOG(ERROR) << "Failed to make thrift call to Switch Agent. Error: "
                  << folly::exceptionStr(e);
@@ -98,14 +99,6 @@ Fib::prepare() noexcept {
     LOG(FATAL) << "Error setting ZMQ_SUBSCRIBE to "
                << ""
                << " " << decisionSubOpt.error();
-  }
-
-  VLOG(2) << "Fib: Connecting to decision module '" << decisionRepUrl_ << "'";
-  const auto reqConnect =
-      decisionReq_.connect(fbzmq::SocketUrl{decisionRepUrl_});
-  if (reqConnect.hasError()) {
-    LOG(FATAL) << "Error connecting to URL '" << decisionRepUrl_ << "' "
-               << reqConnect.error();
   }
 
   VLOG(2) << "Fib: Binding to rep url '" << fibRepUrl_ << "'";
@@ -165,6 +158,7 @@ Fib::prepare() noexcept {
         serializer_, Constants::kReadTimeout);
     if (maybeThriftObj.hasError()) {
       LOG(ERROR) << "Error processing Fib Request: " << maybeThriftObj.error();
+      fibRep_.sendOne(fbzmq::Message::from(Constants::kErrorResponse).value());
       return;
     }
 
@@ -267,10 +261,6 @@ Fib::processInterfaceDb(thrift::InterfaceDatabase&& interfaceDb) {
       LOG(INFO) << "Interface " << ifName << " went DOWN from UP state.";
     }
   }
-
-  std::vector<thrift::UnicastRoute> affectedRoutes;
-  std::vector<thrift::IpPrefix> prefixesToRemove;
-
   for (auto it = routeDb_.begin(); it != routeDb_.end();) {
     // Find valid paths
     std::vector<thrift::Path> validPaths;
@@ -287,8 +277,6 @@ Fib::processInterfaceDb(thrift::InterfaceDatabase&& interfaceDb) {
     // Add to affected routes only if something has changed and also reflect
     // changes in routeDb_
     if (validPaths.size() && validPaths.size() != it->second.size()) {
-      affectedRoutes.emplace_back(thrift::UnicastRoute(
-          apache::thrift::FRAGILE, it->first, validNexthops));
       VLOG(1) << "Nexthop group resize for prefix: " << toString(it->first)
               << ", old: " << it->second.size()
               << ", new: " << validPaths.size();
@@ -299,50 +287,12 @@ Fib::processInterfaceDb(thrift::InterfaceDatabase&& interfaceDb) {
     if (validPaths.size() == 0) {
       VLOG(1) << "Removing prefix " << toString(it->first)
               << " because of no valid nexthops.";
-      prefixesToRemove.push_back(it->first);
       it = routeDb_.erase(it);
     } else {
       ++it;
     }
   } // end for ... routeDb_
-
-  // Do not program routes in case of dryrun
-  if (dryrun_) {
-    LOG(INFO) << "Affected routes: " << affectedRoutes.size();
-    for (auto const& route : affectedRoutes) {
-      VLOG(1) << "> " << toIPAddress(route.dest.prefixAddress) << "/"
-              << route.dest.prefixLength;
-      for (auto const& path : routeDb_[route.dest]) {
-        VLOG(1) << "via " << toIPAddress(path.nextHop) << "@" << path.ifName
-                << " metric " << path.metric;
-      }
-      VLOG(1) << "";
-      logPerfEvents();
-    }
-
-    LOG(INFO) << "Routes to remove: " << prefixesToRemove.size();
-    for (auto const& prefix : prefixesToRemove) {
-      VLOG(1) << "> " << toIPAddress(prefix.prefixAddress) << "/"
-              << prefix.prefixLength;
-    }
-    return;
-  }
-
-  // Make thrift calls to do real programming
-  try {
-    if (maybePerfEvents_) {
-      addPerfEvent(*maybePerfEvents_, myNodeName_, "FIB_DEBOUNCE");
-    }
-    createFibClient();
-    client_->sync_deleteUnicastRoutes(kFibId_, prefixesToRemove);
-    client_->sync_addUnicastRoutes(kFibId_, affectedRoutes);
-    logPerfEvents();
-  } catch (const std::exception& e) {
-    client_.reset();
-    syncRouteDbDebounced(); // Schedule future full sync of route DB
-    LOG(ERROR) << "Failed to make thrift call to Switch Agent. Error: "
-               << folly::exceptionStr(e);
-  }
+  syncRouteDbDebounced();
 }
 
 thrift::RouteDatabase
@@ -387,7 +337,7 @@ Fib::syncRouteDb() {
   }
 
   // Build routes to be programmed.
-  std::vector<thrift::UnicastRoute> routes;
+  std::set<thrift::UnicastRoute> newRoutes;
 
   for (auto const& kv : routeDb_) {
     DCHECK(kv.second.size() > 0);
@@ -402,23 +352,55 @@ Fib::syncRouteDb() {
     }
 
     // Create thrift::UnicastRoute object in-place
-    routes.emplace_back(
+    newRoutes.emplace(
         apache::thrift::FRAGILE, kv.first /* prefix */, std::move(nexthops));
   } // for ... routeDb_
+
+  std::vector<thrift::UnicastRoute> routesToAdd;
+  std::set_difference(
+    newRoutes.begin(), newRoutes.end(),
+    agentRoutes_.begin(), agentRoutes_.end(),
+    std::inserter(routesToAdd, routesToAdd.begin()));
+  std::vector<thrift::UnicastRoute> routesToRemoveOrUpdate;
+  std::set_difference(
+    agentRoutes_.begin(), agentRoutes_.end(),
+    newRoutes.begin(), newRoutes.end(),
+    std::inserter(routesToRemoveOrUpdate, routesToRemoveOrUpdate.begin()));
+  std::set<thrift::IpPrefix> prefixesToRemove;
+  for (const auto& route : routesToRemoveOrUpdate) {
+    prefixesToRemove.emplace(route.dest);
+  }
+  for (const auto& route : routesToAdd) {
+    prefixesToRemove.erase(route.dest);
+  }
 
   try {
     if (maybePerfEvents_) {
       addPerfEvent(*maybePerfEvents_, myNodeName_, "FIB_DEBOUNCE");
     }
     createFibClient();
-    tData_.addStatValue("fib.sync_fib_calls", 1, fbzmq::COUNT);
-    client_->sync_syncFib(kFibId_, routes);
+    if (agentRoutes_.empty()) {
+      tData_.addStatValue("fib.sync_fib_calls", 1, fbzmq::COUNT);
+      client_->sync_syncFib(kFibId_, routesToAdd);
+    } else {
+      if (!routesToAdd.empty()) {
+        tData_.addStatValue("fib.add_routes_calls", 1, fbzmq::COUNT);
+        client_->sync_addUnicastRoutes(kFibId_, routesToAdd);
+      }
+      if (!prefixesToRemove.empty()) {
+        tData_.addStatValue("fib.delete_routes_calls", 1, fbzmq::COUNT);
+        client_->sync_deleteUnicastRoutes(kFibId_,
+          {prefixesToRemove.begin(), prefixesToRemove.end()});
+      }
+    }
+    agentRoutes_ = std::move(newRoutes);
     logPerfEvents();
     return true;
   } catch (std::exception const& e) {
-    tData_.addStatValue("fib.sync_fib_failure", 1, fbzmq::COUNT);
+    tData_.addStatValue("fib.thrift.failure.sync_fib", 1, fbzmq::COUNT);
     LOG(ERROR) << "Failed to sync routeDb with switch FIB agent. Error: "
                << folly::exceptionStr(e);
+    agentRoutes_.clear();
     client_.reset();
     return false;
   }
@@ -440,7 +422,11 @@ Fib::keepAliveCheck() {
   if (aliveSince != latestAliveSince_) {
     LOG(WARNING) << "FibAgent seems to have restarted. "
                  << "Performing full route DB sync ...";
-    syncRouteDbDebounced();
+    agentRoutes_.clear();
+    // reset our backoff and wait coldStartDuration_ to try to program routes on
+    // the newly started agent.
+    expBackoff_.reportSuccess();
+    syncRoutesTimer_->scheduleTimeout(coldStartDuration_);
   }
   latestAliveSince_ = aliveSince;
 }
@@ -479,7 +465,7 @@ Fib::createFibClient() {
 
 void
 Fib::submitCounters() {
-  VLOG(2) << "Submitting counters ... ";
+  VLOG(3) << "Submitting counters ... ";
 
   // Extract/build counters from thread-data
   auto counters = tData_.getCounters();
@@ -487,6 +473,9 @@ Fib::submitCounters() {
   // Add some more flat counters
   counters["fib.num_routes"] = routeDb_.size();
   counters["fib.require_routedb_sync"] = syncRoutesTimer_->isScheduled();
+
+  // Aliveness report counters
+  counters["fib.aliveness"] = 1;
 
   // Prepare for submitting counters
   fbzmq::CounterMap submittingCounters = prepareSubmitCounters(counters);
@@ -510,22 +499,42 @@ Fib::logEvent(const std::string& event) {
 
 void
 Fib::logPerfEvents() {
-  if (!maybePerfEvents_) {
+  if (!maybePerfEvents_ or !maybePerfEvents_->events.size()) {
+    LOG(ERROR) << "Received null or empty perf events to log!";
     return;
+  }
+
+  // Ignore bad perf event sample if creation time of first event is
+  // less than creation time of our recently logged perf events.
+  if (recentPerfEventCreateTs_ >= maybePerfEvents_->events[0].unixTs) {
+    LOG(WARNING) << "Ignoring perf event with old create timestamp "
+                 << maybePerfEvents_->events[0].unixTs << ", expected > "
+                 << recentPerfEventCreateTs_;
+    return;
+  } else {
+    recentPerfEventCreateTs_ = maybePerfEvents_->events[0].unixTs;
   }
 
   // Add latest event information (this function is meant to be called after
   // routeDb has synced)
   addPerfEvent(*maybePerfEvents_, myNodeName_, "OPENR_FIB_ROUTES_PROGRAMMED");
 
-  // Update local perfDb_
+  // Ignore perf events with very off total duration
+  auto totalDuration = getTotalPerfEventsDuration(*maybePerfEvents_);
+  if (totalDuration.count() < 0 or
+      totalDuration > Constants::kConvergenceMaxDuration) {
+    LOG(WARNING) << "Ignoring perf event with bad total duration "
+                 << totalDuration.count() << "ms.";
+    return;
+  }
+
+  // Add new entry to perf DB and purge extra entries
+  perfDb_.push_back(*maybePerfEvents_);
   while (perfDb_.size() >= Constants::kPerfBufferSize) {
     perfDb_.pop_front();
   }
-  perfDb_.push_back(*maybePerfEvents_);
 
   // Log event
-  auto totalDuration = getTotalPerfEventsDuration(*maybePerfEvents_);
   auto eventStrs = sprintPerfEvents(*maybePerfEvents_);
   maybePerfEvents_ = folly::none;
   LOG(INFO) << "OpenR convergence performance. "
@@ -533,13 +542,10 @@ Fib::logPerfEvents() {
   for (auto& str : eventStrs) {
     LOG(INFO) << "  " << str;
   }
-  // Add information to counters
-  // kConvergenceMax is used to gate unreasonable convergence time due to
-  // device time out-of-sync etc.
-  if (totalDuration.count() < kConvergenceMax) {
-    tData_.addStatValue(
-        "fib.convergence_time_ms", totalDuration.count(), fbzmq::AVG);
-  }
+
+  // Export convergence duration counter
+  tData_.addStatValue(
+      "fib.convergence_time_ms", totalDuration.count(), fbzmq::AVG);
 
   // Log via zmq monitor
   fbzmq::LogSample sample{};

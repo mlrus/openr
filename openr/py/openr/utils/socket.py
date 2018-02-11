@@ -13,7 +13,6 @@ from __future__ import division
 import zmq
 
 from openr.utils import serializer, consts
-from thrift.protocol.TCompactProtocol import TCompactProtocolFactory
 
 
 # enumeration of socket status
@@ -24,7 +23,7 @@ class SocketStatus:
 class Socket():
 
     def __init__(self, zmq_ctx, socket_type, timeout=consts.Consts.TIMEOUT_MS,
-                 proto_factory=TCompactProtocolFactory):
+                 proto_factory=consts.Consts.PROTO_FACTORY):
         ''' Initialize socket '''
 
         self.zmq_ctx = zmq_ctx
@@ -84,6 +83,14 @@ class Socket():
         raw_msg = self.recv()
         return serializer.deserialize_thrift_object(raw_msg, thrift_type,
                                                     self.proto_factory)
+
+    def send(self, data):
+        ''' send binary data on socket '''
+
+        try:
+            self._socket.send(str(data))
+        except Exception as ex:
+            raise Exception("Failed sending message: {}".format(ex))
 
     def send_thrift_obj(self, thrift_obj):
         ''' Serialize thrift object and send to socket '''

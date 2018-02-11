@@ -40,6 +40,7 @@
 #include <openr/prefix-manager/PrefixManager.h>
 #include <openr/prefix-manager/PrefixManagerClient.h>
 #include <openr/spark/Spark.h>
+#include <openr/watchdog/Watchdog.h>
 
 DEFINE_int32(
     kvstore_pub_port,
@@ -116,6 +117,7 @@ DEFINE_string(
     "it will be injected later together with allocated prefix length");
 DEFINE_bool(enable_prefix_alloc, false, "Enable automatic prefix allocation");
 DEFINE_int32(alloc_prefix_len, 128, "Allocated prefix length");
+DEFINE_bool(static_prefix_alloc, false, "Perform static prefix allocation");
 DEFINE_bool(
     set_loopback_address,
     false,
@@ -148,7 +150,7 @@ DEFINE_string(
 DEFINE_string(
     redistribute_ifnames,
     "",
-    "The interface names who's prefixes we want to advertise");
+    "The interface names or regex who's prefixes we want to advertise");
 DEFINE_bool(enable_auth, false, "Enable known keys authentication in Spark");
 DEFINE_string(known_keys_file_path, "/tmp/known_keys.json", "Known keys file");
 DEFINE_string(
@@ -245,6 +247,21 @@ DEFINE_int32(
     250,
     "Decision debounce time to update spf in frequent adj db update "
     "(in milliseconds)");
+DEFINE_bool(
+    enable_watchdog,
+    true,
+    "Enable watchdog thread to periodically check aliveness counters from each "
+    "openr thread, if unhealthy thread is detected, force crash openr");
+DEFINE_int32(watchdog_interval_s, 20, "Watchdog thread healthcheck interval");
+DEFINE_int32(watchdog_threshold_s, 300, "Watchdog thread aliveness threshold");
+DEFINE_bool(
+    advertise_interface_db,
+    false,
+    "Flag to optionally advertise interface-DB information in KvStore.");
+DEFINE_bool(
+    enable_segment_routing,
+    false,
+    "Flag to disable/enable segment routing");
 
 using namespace fbzmq;
 using namespace openr;
@@ -253,6 +270,10 @@ using namespace folly::gen;
 
 using apache::thrift::CompactSerializer;
 using apache::thrift::FRAGILE;
+using apache::thrift::concurrency::ThreadManager;
+
+// Disable background jemalloc background thread => new jemalloc-5 feature
+const char* malloc_conf = "background_thread:false";
 
 namespace {
 //
@@ -266,10 +287,12 @@ const SparkReportUrl kSparkReportUrl{"inproc://spark_server_report"};
 const SparkCmdUrl kSparkCmdUrl{"inproc://spark_server_cmd"};
 
 // the URL Prefix for the ConfigStore module
-const std::string kConfigStoreUrlPrefix{"ipc:///tmp/config_store_cmd"};
+const PersistentStoreUrl kConfigStoreUrl{"ipc:///tmp/openr_config_store_cmd"};
 
 const PrefixManagerLocalCmdUrl kPrefixManagerLocalCmdUrl{
     "inproc://prefix_manager_cmd_local"};
+
+const fbzmq::SocketUrl kForceCrashServerUrl{"ipc:///tmp/force_crash_server"};
 
 } // namespace
 
@@ -331,10 +354,24 @@ main(int argc, char** argv) {
   // Set up the zmq context for this process.
   Context context;
 
-  // Pad node_name after kConfigStoreUrlPrefix to differentiate nodes within a
-  // same host in emulator.
-  const PersistentStoreUrl kConfigStoreUrl{
-      folly::sformat("{}_{}", kConfigStoreUrlPrefix, FLAGS_node_name)};
+  // Register force crash handler
+  fbzmq::Socket<ZMQ_REP, fbzmq::ZMQ_SERVER> forceCrashServer{
+      context, folly::none, folly::none, fbzmq::NonblockingFlag{true}};
+  auto ret = forceCrashServer.bind(kForceCrashServerUrl);
+  if (ret.hasError()) {
+    LOG(ERROR) << "Failed to bind on {}" << std::string(kForceCrashServerUrl);
+    return 1;
+  }
+  mainEventLoop.addSocket(
+      fbzmq::RawZmqSocketPtr{*forceCrashServer}, ZMQ_POLLIN,
+      [&](int) noexcept {
+        auto msg = forceCrashServer.recvOne();
+        if (msg.hasError()) {
+          LOG(ERROR) << "Failed receiving message on forceCrashServer.";
+        }
+        LOG(FATAL) << "Triggering forceful crash. "
+                   << msg->read<std::string>().value();
+      });
 
   // Hack to assign different thread name to ZMQ threads for brevity. Bind
   // starts zmq ctx and reaper threads
@@ -345,16 +382,48 @@ main(int argc, char** argv) {
   }
   folly::setThreadName("openr");
 
+  // Watchdog thread to monitor thread aliveness
+  std::unique_ptr<Watchdog> watchdog{nullptr};
+  if (FLAGS_enable_watchdog) {
+    watchdog = std::make_unique<Watchdog>(
+      FLAGS_node_name,
+      std::chrono::seconds(FLAGS_watchdog_interval_s),
+      std::chrono::seconds(FLAGS_watchdog_threshold_s));
+
+    // Spawn a watchdog thread
+    allThreads.emplace_back(std::thread([&watchdog]() noexcept {
+      LOG(INFO) << "Starting Watchdog thread ...";
+      folly::setThreadName("Watchdog");
+      watchdog->run();
+      LOG(INFO) << "Watchdog thread got stopped.";
+    }));
+    watchdog->waitUntilRunning();
+  }
+
+  // Create ThreadManager for thrift services
+  std::shared_ptr<ThreadManager> thriftThreadMgr;
+  if (FLAGS_enable_netlink_fib_handler or FLAGS_enable_netlink_system_handler) {
+    thriftThreadMgr = ThreadManager::newPriorityQueueThreadManager(
+        2 /* num of threads */,
+        false /* task stats */);
+    thriftThreadMgr->setNamePrefix("ThriftCpuPool");
+    thriftThreadMgr->start();
+  }
+
   // Start NetlinkFibHandler if specified
   std::unique_ptr<apache::thrift::ThriftServer> netlinkFibServer;
   if (FLAGS_enable_netlink_fib_handler) {
-    netlinkFibServer = std::make_unique<apache::thrift::ThriftServer>();
+    CHECK(thriftThreadMgr);
+    netlinkFibServer = std::make_unique<apache::thrift::ThriftServer>(
+        "disabled" /* sasl policy */, false /* insecure-loopback */);
+    netlinkFibServer->setThreadManager(thriftThreadMgr);
+    netlinkFibServer->setNumIOWorkerThreads(1);
+    netlinkFibServer->setCpp2WorkerThreadName("FibTWorker");
+    netlinkFibServer->setPort(FLAGS_fib_agent_port);
+
     auto fibThriftThread = std::thread([&netlinkFibServer, &mainEventLoop]() {
       folly::setThreadName("FibService");
       auto fibHandler = std::make_shared<NetlinkFibHandler>(&mainEventLoop);
-      netlinkFibServer->setNWorkerThreads(1);
-      netlinkFibServer->setNPoolThreads(1);
-      netlinkFibServer->setPort(FLAGS_fib_agent_port);
       netlinkFibServer->setInterface(fibHandler);
 
       LOG(INFO) << "Starting NetlinkFib server...";
@@ -367,7 +436,14 @@ main(int argc, char** argv) {
   // Start NetlinkSystemHandler if specified
   std::unique_ptr<apache::thrift::ThriftServer> netlinkSystemServer;
   if (FLAGS_enable_netlink_system_handler) {
-    netlinkSystemServer = std::make_unique<apache::thrift::ThriftServer>();
+    CHECK(thriftThreadMgr);
+    netlinkSystemServer = std::make_unique<apache::thrift::ThriftServer>(
+        "disabled" /* sasl policy */, false /* insecure-loopback */);
+    netlinkSystemServer->setThreadManager(thriftThreadMgr);
+    netlinkSystemServer->setNumIOWorkerThreads(1);
+    netlinkSystemServer->setCpp2WorkerThreadName("SystemTWorker");
+    netlinkSystemServer->setPort(FLAGS_system_agent_port);
+
     auto systemThriftThread =
         std::thread([&netlinkSystemServer, &context, &mainEventLoop]() {
           folly::setThreadName("SystemService");
@@ -375,9 +451,6 @@ main(int argc, char** argv) {
               context,
               PlatformPublisherUrl{FLAGS_platform_pub_url},
               &mainEventLoop);
-          netlinkSystemServer->setNWorkerThreads(1);
-          netlinkSystemServer->setNPoolThreads(1);
-          netlinkSystemServer->setPort(FLAGS_system_agent_port);
           netlinkSystemServer->setInterface(std::move(systemHandler));
 
           LOG(INFO) << "Starting NetlinkSystem server...";
@@ -456,6 +529,7 @@ main(int argc, char** argv) {
   });
   store.waitUntilRunning();
   allThreads.emplace_back(std::move(kvStoreThread));
+  watchdog->addEvl(&store, "KvStore");
 
   // start prefix manager
   PrefixManager prefixManager(
@@ -469,6 +543,7 @@ main(int argc, char** argv) {
       FLAGS_enable_encryption ? keyPair : folly::none,
       PrefixDbMarker{Constants::kPrefixDbMarker},
       FLAGS_enable_perf_measurement,
+      monitorSubmitUrl,
       context);
 
   allThreads.emplace_back(std::thread([&prefixManager]() noexcept {
@@ -477,15 +552,22 @@ main(int argc, char** argv) {
     prefixManager.run();
     LOG(INFO) << "PrefixManager thread got stopped.";
   }));
+  watchdog->addEvl(&prefixManager, "PrefixManager");
   prefixManager.waitUntilRunning();
 
   // Prefix Allocator to automatically allocate prefixes for nodes
   std::unique_ptr<PrefixAllocator> prefixAllocator;
   if (FLAGS_enable_prefix_alloc) {
     // start prefix allocator
-    folly::Optional<folly::CIDRNetwork> seedPrefix;
-    if (!FLAGS_seed_prefix.empty()) {
-      seedPrefix.emplace(folly::IPAddress::createNetwork(FLAGS_seed_prefix));
+    PrefixAllocatorMode allocMode;
+    if (FLAGS_static_prefix_alloc) {
+      allocMode = PrefixAllocatorModeStatic();
+    } else if (!FLAGS_seed_prefix.empty()) {
+      allocMode = std::make_pair(
+          folly::IPAddress::createNetwork(FLAGS_seed_prefix),
+          static_cast<uint8_t>(FLAGS_alloc_prefix_len));
+    } else {
+      allocMode = PrefixAllocatorModeSeeded();
     }
     prefixAllocator = std::make_unique<PrefixAllocator>(
         FLAGS_node_name,
@@ -494,8 +576,7 @@ main(int argc, char** argv) {
         kPrefixManagerLocalCmdUrl,
         monitorSubmitUrl,
         AllocPrefixMarker{Constants::kPrefixAllocMarker},
-        seedPrefix,
-        FLAGS_alloc_prefix_len,
+        allocMode,
         FLAGS_set_loopback_address,
         FLAGS_override_loopback_global_addresses,
         FLAGS_iface,
@@ -509,6 +590,7 @@ main(int argc, char** argv) {
       prefixAllocator->run();
       LOG(INFO) << "PrefixAllocator thread got stopped.";
     }));
+    watchdog->addEvl(prefixAllocator.get(), "PrefixAllocator");
     prefixAllocator->waitUntilRunning();
   }
 
@@ -544,6 +626,7 @@ main(int argc, char** argv) {
   });
   spark.waitUntilRunning();
   allThreads.emplace_back(std::move(sparkThread));
+  watchdog->addEvl(&spark, "Spark");
 
   // Static list of prefixes to announce into the network as long as OpenR is
   // running.
@@ -572,20 +655,13 @@ main(int argc, char** argv) {
     return -1;
   }
 
-  std::vector<std::string> redistIfNamesVec;
-  folly::split(
-      ",",
-      FLAGS_redistribute_ifnames,
-      redistIfNamesVec,
-      true /* ignore empty */);
-  std::set<std::string> redistIfNames(
-      redistIfNamesVec.begin(), redistIfNamesVec.end());
 
   //
   // Construct the regular expressions to match interface names against
   //
+
   std::vector<std::string> regexIncludeStrings;
-  folly::split(",", FLAGS_ifname_regex_include, regexIncludeStrings);
+  folly::split(",", FLAGS_ifname_regex_include, regexIncludeStrings, true);
   std::vector<std::regex> includeRegexList;
   auto const regexOpts = std::regex_constants::extended |
       std::regex_constants::icase | std::regex_constants::optimize;
@@ -595,16 +671,23 @@ main(int argc, char** argv) {
   }
   // add prefixes
   std::vector<std::string> ifNamePrefixes;
-  folly::split(",", FLAGS_ifname_prefix, ifNamePrefixes);
+  folly::split(",", FLAGS_ifname_prefix, ifNamePrefixes, true);
   for (auto& prefix : ifNamePrefixes) {
     includeRegexList.emplace_back(prefix + ".*", regexOpts);
   }
 
   std::vector<std::string> regexExcludeStrings;
-  folly::split(",", FLAGS_ifname_regex_exclude, regexExcludeStrings);
+  folly::split(",", FLAGS_ifname_regex_exclude, regexExcludeStrings, true);
   std::vector<std::regex> excludeRegexList;
   for (auto& regexStr : regexExcludeStrings) {
     excludeRegexList.emplace_back(regexStr, regexOpts);
+  }
+
+  std::vector<std::string> redistStringList;
+  folly::split(",", FLAGS_redistribute_ifnames, redistStringList, true);
+  std::vector<std::regex> redistRegexList;
+  for (auto const& regexStr : redistStringList) {
+    redistRegexList.emplace_back(regexStr, regexOpts);
   }
 
   // Create link monitor instance.
@@ -616,12 +699,14 @@ main(int argc, char** argv) {
       KvStoreLocalPubUrl{kvStoreLocalPubUrl},
       includeRegexList,
       excludeRegexList,
-      redistIfNames,
+      redistRegexList,
       networks,
       FLAGS_use_rtt_metric,
       FLAGS_enable_full_mesh_reduction,
       FLAGS_enable_perf_measurement,
       FLAGS_enable_v4,
+      FLAGS_advertise_interface_db,
+      FLAGS_enable_segment_routing,
       AdjacencyDbMarker{Constants::kAdjDbMarker},
       InterfaceDbMarker{Constants::kInterfaceDbMarker},
       SparkCmdUrl{kSparkCmdUrl},
@@ -647,6 +732,7 @@ main(int argc, char** argv) {
   });
   linkMonitor.waitUntilRunning();
   allThreads.emplace_back(std::move(linkMonitorThread));
+  watchdog->addEvl(&linkMonitor, "LinkMonitor");
 
   // Wait for the above two threads to start and run before running
   // SPF in Decision module.  This is to make sure the Decision module
@@ -676,6 +762,7 @@ main(int argc, char** argv) {
   });
   decision.waitUntilRunning();
   allThreads.emplace_back(std::move(decisionThread));
+  watchdog->addEvl(&decision, "Decision");
 
   // Define and start Fib Module
   Fib fib(
@@ -684,7 +771,6 @@ main(int argc, char** argv) {
       FLAGS_dryrun,
       std::chrono::seconds(3 * FLAGS_spark_keepalive_time_s),
       DecisionPubUrl{folly::sformat("tcp://[::1]:{}", FLAGS_decision_pub_port)},
-      DecisionCmdUrl{folly::sformat("tcp://[::1]:{}", FLAGS_decision_rep_port)},
       FibCmdUrl{
           folly::sformat("tcp://{}:{}", FLAGS_listen_addr, FLAGS_fib_rep_port)},
       LinkMonitorGlobalPubUrl{
@@ -700,6 +786,7 @@ main(int argc, char** argv) {
     LOG(INFO) << "FIB thread got stopped.";
   }));
   fib.waitUntilRunning();
+  watchdog->addEvl(&fib, "Fib");
 
   // Define and start HealthChecker
   std::unique_ptr<HealthChecker> healthChecker{nullptr};
@@ -710,12 +797,13 @@ main(int argc, char** argv) {
         FLAGS_health_check_pct,
         static_cast<uint16_t>(FLAGS_health_checker_port),
         std::chrono::seconds(FLAGS_health_checker_ping_interval_s),
+        maybeIpTos,
         AdjacencyDbMarker{Constants::kAdjDbMarker},
         PrefixDbMarker{Constants::kPrefixDbMarker},
         kvStoreLocalCmdUrl,
         kvStoreLocalPubUrl,
-        HealthCheckerCmdUrl{
-            folly::sformat("tcp://[::1]:{}", FLAGS_health_checker_rep_port)},
+        HealthCheckerCmdUrl{folly::sformat(
+          "tcp://{}:{}", FLAGS_listen_addr, FLAGS_health_checker_rep_port)},
         monitorSubmitUrl,
         context);
     // Spawn a HealthChecker thread
@@ -726,6 +814,7 @@ main(int argc, char** argv) {
       LOG(INFO) << "HealthChecker thread got stopped.";
     }));
     healthChecker->waitUntilRunning();
+    watchdog->addEvl(healthChecker.get(), "HealthChecker");
   }
 
   LOG(INFO) << "Starting main event loop...";
@@ -762,6 +851,13 @@ main(int argc, char** argv) {
   }
   if (netlinkSystemServer) {
     netlinkSystemServer->stop();
+  }
+  if (thriftThreadMgr) {
+    thriftThreadMgr->stop();
+  }
+  if (watchdog) {
+    watchdog->stop();
+    watchdog->waitUntilStopped();
   }
 
   // Wait for all threads to finish

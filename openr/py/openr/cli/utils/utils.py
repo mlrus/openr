@@ -14,12 +14,14 @@ import bunch
 import click
 import copy
 import datetime
+import ipaddr
 import json
 import socket
 import sys
 import zmq
 
 from itertools import product
+from openr.AllocPrefix import ttypes as alloc_types
 from openr.clients.kvstore_client import KvStoreClient
 from openr.clients.lm_client import LMClient
 from openr.IpPrefix import ttypes as ip_types
@@ -59,6 +61,18 @@ def yesno(question):
             return False
 
 
+def json_dumps(data):
+    '''
+    Gives consistent formatting for JSON dumps for our CLI
+
+    :param data: python dictionary object
+
+    :return: json encoded string
+    '''
+
+    return json.dumps(data, sort_keys=True, indent=2, ensure_ascii=False)
+
+
 def time_since(timestamp):
     '''
     :param timestamp: in seconds since unix time
@@ -86,6 +100,19 @@ def time_since(timestamp):
     else:
         fmt = "{minutes}m{seconds}s"
     return fmt.format(**d)
+
+
+def contain_any_prefix(prefix, ip_networks):
+    '''
+    Utility function to check if prefix contain any of the prefixes/ips
+
+    :returns: True if prefix contains any of the ip_networks else False
+    '''
+
+    if ip_networks is None:
+        return True
+    prefix = ipaddr.IPNetwork(prefix)
+    return any([prefix.Contains(net) for net in ip_networks])
 
 
 def get_fib_agent_client(host, port, timeout_ms,
@@ -223,6 +250,22 @@ def ip_str_to_prefix(prefix_str):
         prefixLength=int(ip_len_str))
 
 
+def alloc_prefix_to_loopback_ip_str(prefix):
+    '''
+    :param prefix: IpPrefix representing an allocation prefix (CIDR network)
+
+    :returns: Loopback IP corresponding to allocation prefix
+    :rtype: string
+    '''
+
+    ip_addr = prefix.prefixAddress.addr
+    print(ip_addr)
+    if prefix.prefixLength != 128:
+        ip_addr = ip_addr[:-1] + chr(ord(ip_addr[-1]) | 1)
+    print(ip_addr)
+    return sprint_addr(ip_addr)
+
+
 def print_prefixes_table(resp, nodes, iter_func):
     ''' print prefixes '''
 
@@ -239,16 +282,19 @@ def print_prefixes_table(resp, nodes, iter_func):
     print(printing.render_vertical_table(rows))
 
 
-def thrift_to_dict(thrift_inst, update_func):
+def thrift_to_dict(thrift_inst, update_func=None):
     ''' convert thrift instance into a dict in strings
 
         :param thrift_inst: a thrift instance
+        :param update_func: transformation function to update dict value of
+                            thrift object. It is optional.
 
         :return dict: dict with attributes as key, value in strings
     '''
 
     gen_dict = copy.copy(thrift_inst).__dict__
-    update_func(gen_dict, thrift_inst)
+    if update_func is not None:
+        update_func(gen_dict, thrift_inst)
 
     return gen_dict
 
@@ -278,7 +324,7 @@ def print_prefixes_json(resp, nodes, iter_func):
 
     prefixes_map = {}
     iter_func(prefixes_map, resp, nodes, _parse_prefixes)
-    print(json.dumps(prefixes_map, sort_keys=True, indent=4))
+    print(json_dumps(prefixes_map))
 
 
 def update_global_adj_db(global_adj_db, adj_db):
@@ -359,7 +405,6 @@ def build_global_interface_db(resp):
         intf_db = interface_db_to_dict(value)
         global_intf_db[intf_db.thisNodeName] = intf_db
     return global_intf_db
-
 
 
 def dump_adj_db_full(global_adj_db, adj_db, bidir):
@@ -461,7 +506,8 @@ def print_adjs_json(adjs_map):
 
         :param adjacencies as list of dict
     '''
-    print(json.dumps(adjs_map, sort_keys=True, indent=4))
+
+    print(json_dumps(adjs_map))
 
 
 def print_adjs_table(adjs_map, enable_color):
@@ -634,12 +680,19 @@ def print_interfaces_table(intf_map, print_all):
     print('\n'.join(lines))
 
 
-def print_routes_table(route_db):
+def print_routes_table(route_db, prefixes=None):
     ''' print the the routes from Decision/Fib module '''
+
+    networks = None
+    if prefixes:
+        networks = [ipaddr.IPNetwork(p) for p in prefixes]
 
     route_strs = []
     for route in sorted(route_db.routes, key=lambda x: x.prefix.prefixAddress.addr):
         prefix_str = sprint_prefix(route.prefix)
+        if not contain_any_prefix(prefix_str, networks):
+            continue
+
         paths_str = '\n'.join(["via {}@{} metric {}".format(
             sprint_addr(path.nextHop.addr),
             path.ifName, path.metric) for path in route.paths])
@@ -680,8 +733,22 @@ def route_db_to_dict(route_db):
     return {'routes': map(route_to_dict, route_db.routes)}
 
 
-def print_routes_json(route_db_dict):
-    print(json.dumps(route_db_dict, sort_keys=True, indent=4))
+def print_routes_json(route_db_dict, prefixes=None):
+
+    networks = None
+    if prefixes:
+        networks = [ipaddr.IPNetwork(p) for p in prefixes]
+
+    # Filter out all routes based on prefixes!
+    for routes in route_db_dict.values():
+        filtered_routes = []
+        for route in routes["routes"]:
+            if not contain_any_prefix(route["prefix"], networks):
+                continue
+            filtered_routes.append(route)
+        routes["routes"] = filtered_routes
+
+    print(json_dumps(route_db_dict))
 
 
 def find_adj_list_deltas(old_adj_list, new_adj_list):
@@ -770,6 +837,9 @@ def sprint_pub_update(global_publication_db, key, value):
     if old_originator_id != value.originatorId:
         rows.append(["originatorId:", old_originator_id, "-->",
                     value.originatorId])
+    ttl = 'INF' if value.ttl == Consts.CONST_TTL_INF else value.ttl
+    rows.append(["ttlVersion:", "", "-->", value.ttlVersion])
+    rows.append(["ttl:", "", "-->", ttl])
     global_publication_db[key] = (value.version, value.originatorId)
     return printing.render_horizontal_table(rows, tablefmt="plain") if rows else ""
 
@@ -865,10 +935,10 @@ def sprint_interface_db_delta(new_intf_db, old_intf_db):
 
     for intf_name in added_intfs:
         lines.append('INTERFACE_ADDED: {}\n'.format(intf_name))
-        intf = new_intfs.interfaces[intf_name]
+        intf = new_intf_db.interfaces[intf_name]
         rows = []
         for k in sorted(intf.keys()):
-            rows.append([k, intf.get(k), intf.get(k)])
+            rows.append([k, "", "-->", intf.get(k)])
         lines.append(printing.render_horizontal_table(rows, tablefmt='plain'))
 
     for intf_name in removed_intfs:
@@ -921,6 +991,17 @@ def dump_node_kvs(node, kv_rep_port):
     try:
         kv = client.dump_all_with_prefix()
     except zmq.error.Again:
-        print('cannot connect to {}\' kvstore'.format(node))
+        print('cannot connect to {}\'s kvstore'.format(node))
         return None
     return kv
+
+
+def print_allocations_table(alloc_str):
+    ''' print static allocations '''
+
+    rows = []
+    allocations = deserialize_thrift_object(
+        alloc_str, alloc_types.StaticAllocation)
+    for node, prefix in allocations.nodePrefixes.items():
+        rows.append([node, sprint_prefix(prefix)])
+    print(printing.render_horizontal_table(rows, ['Node', 'Prefix']))

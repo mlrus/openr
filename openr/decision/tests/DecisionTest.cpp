@@ -29,25 +29,47 @@ using apache::thrift::CompactSerializer;
 using apache::thrift::FRAGILE;
 
 namespace {
-// R1 -> R2, R3
-const auto adj12 = createAdjacency("2", "1/2", "fe80::2", "192.168.0.2", 10, 0);
-const auto adj13 = createAdjacency("3", "1/3", "fe80::3", "192.168.0.3", 10, 0);
+/// R1 -> R2, R3
+const auto adj12 =
+    createAdjacency("2", "1/2", "2/1", "fe80::2", "192.168.0.2", 10, 0);
+const auto adj13 =
+    createAdjacency("3", "1/3", "3/1", "fe80::3", "192.168.0.3", 10, 0);
+const auto adj12_old_1 =
+    createAdjacency("2", "1/2", "", "fe80::2", "192.168.0.2", 10, 0);
+const auto adj12_old_2 =
+    createAdjacency("2", "1/2", "", "fe80::2", "192.168.0.2", 20, 0);
+const auto adj13_old =
+    createAdjacency("3", "1/3", "", "fe80::3", "192.168.0.3", 10, 0);
 // R2 -> R1, R3, R4
-const auto adj21 = createAdjacency("1", "2/1", "fe80::1", "192.168.0.1", 10, 0);
-const auto adj23 = createAdjacency("3", "2/3", "fe80::3", "192.168.0.3", 10, 0);
-const auto adj24 = createAdjacency("4", "2/4", "fe80::4", "192.168.0.4", 10, 0);
+const auto adj21 =
+    createAdjacency("1", "2/1", "1/2", "fe80::1", "192.168.0.1", 10, 0);
+const auto adj21_old_1 =
+    createAdjacency("1", "2/1", "", "fe80::1", "192.168.0.1", 10, 0);
+const auto adj21_old_2 =
+    createAdjacency("1", "2/1", "", "fe80::1", "192.168.0.1", 20, 0);
+const auto adj23 =
+    createAdjacency("3", "2/3", "3/2", "fe80::3", "192.168.0.3", 10, 0);
+const auto adj24 =
+    createAdjacency("4", "2/4", "4/2", "fe80::4", "192.168.0.4", 10, 0);
 // R3 -> R1, R2, R4
-const auto adj31 = createAdjacency("1", "3/1", "fe80::1", "192.168.0.1", 10, 0);
-const auto adj32 = createAdjacency("2", "3/2", "fe80::2", "192.168.0.2", 10, 0);
-const auto adj34 = createAdjacency("4", "3/4", "fe80::4", "192.168.0.4", 10, 0);
+const auto adj31 =
+    createAdjacency("1", "3/1", "1/3", "fe80::1", "192.168.0.1", 10, 0);
+const auto adj32 =
+    createAdjacency("2", "3/2", "2/3", "fe80::2", "192.168.0.2", 10, 0);
+const auto adj34 =
+    createAdjacency("4", "3/4", "4/3", "fe80::4", "192.168.0.4", 10, 0);
 // R4 -> R2, R3
-const auto adj42 = createAdjacency("2", "4/2", "fe80::2", "192.168.0.2", 10, 0);
-const auto adj43 = createAdjacency("3", "4/3", "fe80::3", "192.168.0.3", 10, 0);
+const auto adj42 =
+    createAdjacency("2", "4/2", "2/4", "fe80::2", "192.168.0.2", 10, 0);
+const auto adj43 =
+    createAdjacency("3", "4/3", "3/4", "fe80::3", "192.168.0.3", 10, 0);
 
 const auto addr1 = toIpPrefix("::ffff:10.1.1.1/128");
 const auto addr2 = toIpPrefix("::ffff:10.2.2.2/128");
 const auto addr3 = toIpPrefix("::ffff:10.3.3.3/128");
 const auto addr4 = toIpPrefix("::ffff:10.4.4.4/128");
+const auto addr5 = toIpPrefix("::ffff:10.4.4.5/128");
+const auto addr6 = toIpPrefix("::ffff:10.4.4.6/128");
 const auto addr1V4 = toIpPrefix("10.1.1.1/32");
 const auto addr2V4 = toIpPrefix("10.2.2.2/32");
 const auto addr3V4 = toIpPrefix("10.3.3.3/32");
@@ -70,8 +92,9 @@ const auto prefixDb3V4 =
 const auto prefixDb4V4 =
     createPrefixDb("4", {{FRAGILE, addr4V4, thrift::PrefixType::LOOPBACK, {}}});
 
-// timeout to wait until spf finished
-const std::chrono::milliseconds spfTimeout{250};
+// timeout to wait until decision debounce
+// (i.e. spf recalculation, route rebuild) finished
+const std::chrono::milliseconds debounceTimeout{250};
 
 using NextHop = pair<string /* ifname */, folly::IPAddress /* nexthop ip */>;
 // Note: use unordered_set bcoz paths in a route can be in arbitrary order
@@ -135,11 +158,11 @@ TEST(ShortestPathTest, UnreachableNodes) {
 
   SpfSolver spfSolver(false /* disable v4 */);
 
-  spfSolver.updateAdjacencyDatabase(adjacencyDb1);
-  spfSolver.updateAdjacencyDatabase(adjacencyDb2);
+  EXPECT_FALSE(spfSolver.updateAdjacencyDatabase(adjacencyDb1));
+  EXPECT_FALSE(spfSolver.updateAdjacencyDatabase(adjacencyDb2));
 
-  spfSolver.updatePrefixDatabase(prefixDb1);
-  spfSolver.updatePrefixDatabase(prefixDb2);
+  EXPECT_TRUE(spfSolver.updatePrefixDatabase(prefixDb1));
+  EXPECT_TRUE(spfSolver.updatePrefixDatabase(prefixDb2));
 
   unordered_map<
       pair<string /* node name */, string /* ip prefix */>,
@@ -170,9 +193,9 @@ TEST(ShortestPathTest, MissingNeighborAdjacencyDb) {
   // mention the R2's AdjDb. Add R2's prefixes though.
   //
 
-  spfSolver.updateAdjacencyDatabase(adjacencyDb1);
-  spfSolver.updatePrefixDatabase(prefixDb1);
-  spfSolver.updatePrefixDatabase(prefixDb2);
+  EXPECT_FALSE(spfSolver.updateAdjacencyDatabase(adjacencyDb1));
+  EXPECT_TRUE(spfSolver.updatePrefixDatabase(prefixDb1));
+  EXPECT_FALSE(spfSolver.updatePrefixDatabase(prefixDb2));
 
   auto routeDb = spfSolver.buildShortestPaths("1");
   EXPECT_EQ("1", routeDb.thisNodeName);
@@ -196,10 +219,10 @@ TEST(ShortestPathTest, EmptyNeighborAdjacencyDb) {
   // mention the R2's AdjDb. Add R2's prefixes though.
   //
 
-  spfSolver.updateAdjacencyDatabase(adjacencyDb1);
-  spfSolver.updateAdjacencyDatabase(adjacencyDb2);
-  spfSolver.updatePrefixDatabase(prefixDb1);
-  spfSolver.updatePrefixDatabase(prefixDb2);
+  EXPECT_FALSE(spfSolver.updateAdjacencyDatabase(adjacencyDb1));
+  EXPECT_FALSE(spfSolver.updateAdjacencyDatabase(adjacencyDb2));
+  EXPECT_TRUE(spfSolver.updatePrefixDatabase(prefixDb1));
+  EXPECT_TRUE(spfSolver.updatePrefixDatabase(prefixDb2));
 
   // dump routes for both nodes, expect no routing entries
 
@@ -234,13 +257,13 @@ TEST_P(ConnectivityTest, GraphConnectedOrPartitioned) {
 
   SpfSolver spfSolver(false /* disable v4 */);
 
-  spfSolver.updateAdjacencyDatabase(adjacencyDb1);
-  spfSolver.updateAdjacencyDatabase(adjacencyDb2);
-  spfSolver.updateAdjacencyDatabase(adjacencyDb3);
+  EXPECT_FALSE(spfSolver.updateAdjacencyDatabase(adjacencyDb1));
+  EXPECT_EQ(!partitioned, spfSolver.updateAdjacencyDatabase(adjacencyDb2));
+  EXPECT_EQ(!partitioned, spfSolver.updateAdjacencyDatabase(adjacencyDb3));
 
-  spfSolver.updatePrefixDatabase(prefixDb1);
-  spfSolver.updatePrefixDatabase(prefixDb2);
-  spfSolver.updatePrefixDatabase(prefixDb3);
+  EXPECT_EQ(!partitioned, spfSolver.updatePrefixDatabase(prefixDb1));
+  EXPECT_TRUE(spfSolver.updatePrefixDatabase(prefixDb2));
+  EXPECT_EQ(!partitioned, spfSolver.updatePrefixDatabase(prefixDb3));
 
   // route from 1 to 3
   auto routeDb = spfSolver.buildShortestPaths("1");
@@ -275,11 +298,11 @@ TEST(ConnectivityTest, OverloadNodeTest) {
   // Make node-2 overloaded
   adjacencyDb2.isOverloaded = true;
 
-  EXPECT_TRUE(spfSolver.updatePrefixDatabase(prefixDb1));
-  EXPECT_TRUE(spfSolver.updatePrefixDatabase(prefixDb2));
-  EXPECT_TRUE(spfSolver.updatePrefixDatabase(prefixDb3));
+  EXPECT_FALSE(spfSolver.updatePrefixDatabase(prefixDb1));
+  EXPECT_FALSE(spfSolver.updatePrefixDatabase(prefixDb2));
+  EXPECT_FALSE(spfSolver.updatePrefixDatabase(prefixDb3));
 
-  EXPECT_TRUE(spfSolver.updateAdjacencyDatabase(adjacencyDb1));
+  EXPECT_FALSE(spfSolver.updateAdjacencyDatabase(adjacencyDb1));
   EXPECT_TRUE(spfSolver.updateAdjacencyDatabase(adjacencyDb2));
   EXPECT_TRUE(spfSolver.updateAdjacencyDatabase(adjacencyDb3));
 
@@ -316,6 +339,85 @@ TEST(ConnectivityTest, OverloadNodeTest) {
 }
 
 //
+// AdjacencyDb compatibility test in a circle topology with shortest path
+// calculation
+// In old version remoter interface name is not sepcified
+// 1(old)<--->2(new)<--->3(new)
+//     |  20         10   ^
+//     |                  |
+//     |                  |
+//     |------------------|
+TEST(ConnectivityTest, CompatibilityNodeTest) {
+  SpfSolver spfSolver(false /* disable v4 */);
+
+  // Add all adjacency DBs
+  auto adjacencyDb1 = createAdjDb("1", {adj12_old_1}, 0);
+  auto adjacencyDb2 = createAdjDb("2", {adj21_old_1, adj23}, 0);
+  auto adjacencyDb3 = createAdjDb("3", {adj32, adj31}, 0);
+
+  EXPECT_FALSE(spfSolver.updatePrefixDatabase(prefixDb1));
+  EXPECT_FALSE(spfSolver.updatePrefixDatabase(prefixDb2));
+  EXPECT_FALSE(spfSolver.updatePrefixDatabase(prefixDb3));
+
+  EXPECT_FALSE(spfSolver.updateAdjacencyDatabase(adjacencyDb2));
+  EXPECT_TRUE(spfSolver.updateAdjacencyDatabase(adjacencyDb3));
+  EXPECT_TRUE(spfSolver.updateAdjacencyDatabase(adjacencyDb1));
+
+  // add/update adjacency of node1 with old versions
+  adjacencyDb1 = createAdjDb("1", {adj12_old_1, adj13_old}, 0);
+  EXPECT_TRUE(spfSolver.updateAdjacencyDatabase(adjacencyDb1));
+  adjacencyDb1 = createAdjDb("1", {adj12_old_2, adj13_old}, 0);
+  EXPECT_TRUE(spfSolver.updateAdjacencyDatabase(adjacencyDb1));
+
+  auto routeMap =
+      getRouteMap(spfSolver, false /* shortest path */, {"1", "2", "3"});
+
+  // We only expect 4 routes node-1 and node-3 are connected
+  // node-1 => node-2, node-3
+  // node-2 => node-1, node-3
+  // node-3 => node-2, node-1
+  EXPECT_EQ(6, routeMap.size());
+
+  // validate router 1
+
+  EXPECT_EQ(
+      routeMap[make_pair("1", toString(addr2))],
+      NextHops({make_pair(toNextHop(adj12, false), 20)}));
+
+  EXPECT_EQ(
+      routeMap[make_pair("1", toString(addr3))],
+      NextHops({make_pair(toNextHop(adj13, false), 10)}));
+
+  // validate router 2
+
+  EXPECT_EQ(
+      routeMap[make_pair("2", toString(addr3))],
+      NextHops({make_pair(toNextHop(adj23, false), 10)}));
+
+  EXPECT_EQ(
+      routeMap[make_pair("2", toString(addr1))],
+      NextHops({make_pair(toNextHop(adj21, false), 10)}));
+
+  // validate router 3
+
+  EXPECT_EQ(
+      routeMap[make_pair("3", toString(addr2))],
+      NextHops({make_pair(toNextHop(adj32, false), 10)}));
+  EXPECT_EQ(
+      routeMap[make_pair("3", toString(addr1))],
+      NextHops({make_pair(toNextHop(adj31, false), 10)}));
+
+  // adjacency update (remove adjacency) for node1
+  adjacencyDb1 = createAdjDb("1", {adj12_old_2}, 0);
+  EXPECT_TRUE(spfSolver.updateAdjacencyDatabase(adjacencyDb1));
+  adjacencyDb3 = createAdjDb("3", {adj32}, 0);
+  EXPECT_FALSE(spfSolver.updateAdjacencyDatabase(adjacencyDb3));
+
+  adjacencyDb1 = createAdjDb("1", {adj12_old_2, adj13_old}, 0);
+  EXPECT_FALSE(spfSolver.updateAdjacencyDatabase(adjacencyDb1));
+}
+
+//
 // Test topology:
 //
 //  1------2
@@ -337,15 +439,19 @@ class SimpleRingTopologyFixture : public ::testing::TestWithParam<bool> {
     adjacencyDb3 = createAdjDb("3", {adj31, adj34}, 0);
     adjacencyDb4 = createAdjDb("4", {adj42, adj43}, 0);
 
-    spfSolver.updateAdjacencyDatabase(adjacencyDb1);
-    spfSolver.updateAdjacencyDatabase(adjacencyDb2);
-    spfSolver.updateAdjacencyDatabase(adjacencyDb3);
-    spfSolver.updateAdjacencyDatabase(adjacencyDb4);
+    EXPECT_FALSE(spfSolver.updateAdjacencyDatabase(adjacencyDb1));
+    EXPECT_TRUE(spfSolver.updateAdjacencyDatabase(adjacencyDb2));
+    EXPECT_TRUE(spfSolver.updateAdjacencyDatabase(adjacencyDb3));
+    EXPECT_TRUE(spfSolver.updateAdjacencyDatabase(adjacencyDb4));
 
-    spfSolver.updatePrefixDatabase(v4Enabled ? prefixDb1V4 : prefixDb1);
-    spfSolver.updatePrefixDatabase(v4Enabled ? prefixDb2V4 : prefixDb2);
-    spfSolver.updatePrefixDatabase(v4Enabled ? prefixDb3V4 : prefixDb3);
-    spfSolver.updatePrefixDatabase(v4Enabled ? prefixDb4V4 : prefixDb4);
+    EXPECT_TRUE(
+        spfSolver.updatePrefixDatabase(v4Enabled ? prefixDb1V4 : prefixDb1));
+    EXPECT_TRUE(
+        spfSolver.updatePrefixDatabase(v4Enabled ? prefixDb2V4 : prefixDb2));
+    EXPECT_TRUE(
+        spfSolver.updatePrefixDatabase(v4Enabled ? prefixDb3V4 : prefixDb3));
+    EXPECT_TRUE(
+        spfSolver.updatePrefixDatabase(v4Enabled ? prefixDb4V4 : prefixDb4));
   }
 
   thrift::AdjacencyDatabase adjacencyDb1, adjacencyDb2, adjacencyDb3,
@@ -402,7 +508,7 @@ TEST_P(SimpleRingTopologyFixture, ShortestPathTest) {
 
   EXPECT_EQ(
       routeMap[make_pair("3", toString(v4Enabled ? addr2V4 : addr2))],
-      NextHops({make_pair(toNextHop(adj34, v4Enabled), 20)}));
+      NextHops({make_pair(toNextHop(adj31, v4Enabled), 20)}));
 
   EXPECT_EQ(
       routeMap[make_pair("3", toString(v4Enabled ? addr1V4 : addr1))],
@@ -420,7 +526,7 @@ TEST_P(SimpleRingTopologyFixture, ShortestPathTest) {
 
   EXPECT_EQ(
       routeMap[make_pair("4", toString(v4Enabled ? addr1V4 : addr1))],
-      NextHops({make_pair(toNextHop(adj43, v4Enabled), 20)}));
+      NextHops({make_pair(toNextHop(adj42, v4Enabled), 20)}));
 }
 
 //
@@ -507,8 +613,8 @@ TEST_P(SimpleRingTopologyFixture, AttachedNodesTest) {
       "4",
       {{FRAGILE, addr4, thrift::PrefixType::LOOPBACK, {}},
        {FRAGILE, defaultRoute, thrift::PrefixType::LOOPBACK, {}}});
-  spfSolver.updatePrefixDatabase(prefixDb1);
-  spfSolver.updatePrefixDatabase(prefixDb4);
+  EXPECT_TRUE(spfSolver.updatePrefixDatabase(prefixDb1));
+  EXPECT_TRUE(spfSolver.updatePrefixDatabase(prefixDb4));
 
   auto routeMap =
       getRouteMap(spfSolver, true /* multipath */, {"1", "2", "3", "4"});
@@ -726,31 +832,47 @@ class ParallelAdjRingTopologyFixture : public ::testing::Test {
   void
   SetUp() override {
     // R1 -> R2
-    adj12_1 = createAdjacency("2", "2/1", "fe80::2:1", "192.168.2.1", 10, 0);
-    adj12_2 = createAdjacency("2", "2/2", "fe80::2:2", "192.168.2.2", 10, 0);
-    adj12_3 = createAdjacency("2", "2/3", "fe80::2:3", "192.168.2.3", 20, 0);
+    adj12_1 =
+        createAdjacency("2", "2/1", "1/1", "fe80::2:1", "192.168.2.1", 10, 0);
+    adj12_2 =
+        createAdjacency("2", "2/2", "1/2", "fe80::2:2", "192.168.2.2", 10, 0);
+    adj12_3 =
+        createAdjacency("2", "2/3", "1/3", "fe80::2:3", "192.168.2.3", 20, 0);
     // R1 -> R3
-    adj13_1 = createAdjacency("3", "3/1", "fe80::3:1", "192.168.3.1", 10, 0);
+    adj13_1 =
+        createAdjacency("3", "3/1", "1/1", "fe80::3:1", "192.168.3.1", 10, 0);
 
     // R2 -> R1
-    adj21_1 = createAdjacency("1", "1/1", "fe80::1:1", "192.168.1.1", 10, 0);
-    adj21_2 = createAdjacency("1", "1/2", "fe80::1:2", "192.168.1.2", 10, 0);
-    adj21_3 = createAdjacency("1", "1/3", "fe80::1:3", "192.168.1.3", 20, 0);
+    adj21_1 =
+        createAdjacency("1", "1/1", "2/1", "fe80::1:1", "192.168.1.1", 10, 0);
+    adj21_2 =
+        createAdjacency("1", "1/2", "2/2", "fe80::1:2", "192.168.1.2", 10, 0);
+    adj21_3 =
+        createAdjacency("1", "1/3", "2/3", "fe80::1:3", "192.168.1.3", 20, 0);
     // R2 -> R4
-    adj24_1 = createAdjacency("4", "4/1", "fe80::4:1", "192.168.4.1", 10, 0);
+    adj24_1 =
+        createAdjacency("4", "4/1", "2/1", "fe80::4:1", "192.168.4.1", 10, 0);
 
     // R3 -> R1
-    adj31_1 = createAdjacency("1", "1/1", "fe80::1:1", "192.168.1.1", 10, 0);
+    adj31_1 =
+        createAdjacency("1", "1/1", "3/1", "fe80::1:1", "192.168.1.1", 10, 0);
     // R3 -> R4
-    adj34_1 = createAdjacency("4", "4/1", "fe80::4:1", "192.168.4.1", 10, 0);
-    adj34_2 = createAdjacency("4", "4/2", "fe80::4:2", "192.168.4.2", 20, 0);
-    adj34_3 = createAdjacency("4", "4/3", "fe80::4:3", "192.168.4.3", 20, 0);
+    adj34_1 =
+        createAdjacency("4", "4/1", "3/1", "fe80::4:1", "192.168.4.1", 10, 0);
+    adj34_2 =
+        createAdjacency("4", "4/2", "3/2", "fe80::4:2", "192.168.4.2", 20, 0);
+    adj34_3 =
+        createAdjacency("4", "4/3", "3/3", "fe80::4:3", "192.168.4.3", 20, 0);
 
     // R4 -> R2
-    adj42_1 = createAdjacency("2", "2/1", "fe80::2:1", "192.168.2.1", 10, 0);
-    adj43_1 = createAdjacency("3", "3/1", "fe80::3:1", "192.168.3.1", 10, 0);
-    adj43_2 = createAdjacency("3", "3/2", "fe80::3:2", "192.168.3.2", 20, 0);
-    adj43_3 = createAdjacency("3", "3/3", "fe80::3:3", "192.168.3.3", 20, 0);
+    adj42_1 =
+        createAdjacency("2", "2/1", "4/1", "fe80::2:1", "192.168.2.1", 10, 0);
+    adj43_1 =
+        createAdjacency("3", "3/1", "4/1", "fe80::3:1", "192.168.3.1", 10, 0);
+    adj43_2 =
+        createAdjacency("3", "3/2", "4/2", "fe80::3:2", "192.168.3.2", 20, 0);
+    adj43_3 =
+        createAdjacency("3", "3/3", "4/3", "fe80::3:3", "192.168.3.3", 20, 0);
 
     adjacencyDb1 = createAdjDb("1", {adj12_1, adj12_2, adj12_3, adj13_1}, 0);
 
@@ -760,17 +882,19 @@ class ParallelAdjRingTopologyFixture : public ::testing::Test {
 
     adjacencyDb4 = createAdjDb("4", {adj42_1, adj43_1, adj43_2, adj43_3}, 0);
 
+    // Adjacency db's
+
+    EXPECT_FALSE(spfSolver.updateAdjacencyDatabase(adjacencyDb1));
+    EXPECT_TRUE(spfSolver.updateAdjacencyDatabase(adjacencyDb2));
+    EXPECT_TRUE(spfSolver.updateAdjacencyDatabase(adjacencyDb3));
+    EXPECT_TRUE(spfSolver.updateAdjacencyDatabase(adjacencyDb4));
+
     // Prefix db's
 
-    spfSolver.updateAdjacencyDatabase(adjacencyDb1);
-    spfSolver.updateAdjacencyDatabase(adjacencyDb2);
-    spfSolver.updateAdjacencyDatabase(adjacencyDb3);
-    spfSolver.updateAdjacencyDatabase(adjacencyDb4);
-
-    spfSolver.updatePrefixDatabase(prefixDb1);
-    spfSolver.updatePrefixDatabase(prefixDb2);
-    spfSolver.updatePrefixDatabase(prefixDb3);
-    spfSolver.updatePrefixDatabase(prefixDb4);
+    EXPECT_TRUE(spfSolver.updatePrefixDatabase(prefixDb1));
+    EXPECT_TRUE(spfSolver.updatePrefixDatabase(prefixDb2));
+    EXPECT_TRUE(spfSolver.updatePrefixDatabase(prefixDb3));
+    EXPECT_TRUE(spfSolver.updatePrefixDatabase(prefixDb4));
   }
 
   thrift::Adjacency adj12_1, adj12_2, adj12_3, adj13_1, adj21_1, adj21_2,
@@ -782,7 +906,6 @@ class ParallelAdjRingTopologyFixture : public ::testing::Test {
   SpfSolver spfSolver;
 };
 
-
 TEST_F(ParallelAdjRingTopologyFixture, ShortestPathTest) {
   auto routeMap =
       getRouteMap(spfSolver, false /* shortest path */, {"1", "2", "3", "4"});
@@ -791,7 +914,7 @@ TEST_F(ParallelAdjRingTopologyFixture, ShortestPathTest) {
 
   EXPECT_EQ(
       routeMap[make_pair("1", toString(addr4))],
-      NextHops({make_pair(toNextHop(adj12_1), 20)}));
+      NextHops({make_pair(toNextHop(adj12_2), 20)}));
 
   EXPECT_EQ(
       routeMap[make_pair("1", toString(addr3))],
@@ -799,7 +922,7 @@ TEST_F(ParallelAdjRingTopologyFixture, ShortestPathTest) {
 
   EXPECT_EQ(
       routeMap[make_pair("1", toString(addr2))],
-      NextHops({make_pair(toNextHop(adj12_1), 10)}));
+      NextHops({make_pair(toNextHop(adj12_2), 10)}));
 
   // validate router 2
 
@@ -809,11 +932,11 @@ TEST_F(ParallelAdjRingTopologyFixture, ShortestPathTest) {
 
   EXPECT_EQ(
       routeMap[make_pair("2", toString(addr3))],
-      NextHops({make_pair(toNextHop(adj21_1), 20)}));
+      NextHops({make_pair(toNextHop(adj21_2), 20)}));
 
   EXPECT_EQ(
       routeMap[make_pair("2", toString(addr1))],
-      NextHops({make_pair(toNextHop(adj21_1), 10)}));
+      NextHops({make_pair(toNextHop(adj21_2), 10)}));
 
   // validate router 3
 
@@ -823,7 +946,7 @@ TEST_F(ParallelAdjRingTopologyFixture, ShortestPathTest) {
 
   EXPECT_EQ(
       routeMap[make_pair("3", toString(addr2))],
-      NextHops({make_pair(toNextHop(adj34_1), 20)}));
+      NextHops({make_pair(toNextHop(adj31_1), 20)}));
 
   EXPECT_EQ(
       routeMap[make_pair("3", toString(addr1))],
@@ -841,7 +964,7 @@ TEST_F(ParallelAdjRingTopologyFixture, ShortestPathTest) {
 
   EXPECT_EQ(
       routeMap[make_pair("4", toString(addr1))],
-      NextHops({make_pair(toNextHop(adj43_1), 20)}));
+      NextHops({make_pair(toNextHop(adj42_1), 20)}));
 }
 
 //
@@ -1139,12 +1262,12 @@ class DecisionTestFixture : public ::testing::Test {
   // member methods
   //
 
-  RouteMap
-  dumpRouteMap(
+  std::unordered_map<std::string, thrift::RouteDatabase>
+  dumpRouteDatabase(
       fbzmq::Socket<ZMQ_REQ, fbzmq::ZMQ_CLIENT>& decisionReq,
       const vector<string>& allNodes,
       const apache::thrift::CompactSerializer& serializer) {
-    RouteMap routeMap;
+    std::unordered_map<std::string, thrift::RouteDatabase> routeMap;
 
     for (string const& node : allNodes) {
       decisionReq.sendThriftObj(
@@ -1158,29 +1281,23 @@ class DecisionTestFixture : public ::testing::Test {
       const auto& routeDb = maybeReply.value().routeDb;
       EXPECT_EQ(node, routeDb.thisNodeName);
 
-      fillRouteMap(node, routeMap, routeDb);
+      routeMap[node] = routeDb;
       VLOG(4) << "---";
     }
 
     return routeMap;
   }
 
-  RouteMap
-  recvMyRouteMap(
+  thrift::RouteDatabase
+  recvMyRouteDb(
       fbzmq::Socket<ZMQ_SUB, fbzmq::ZMQ_CLIENT>& decisionPub,
-      const string& myNodeName,
+      const string& /* myNodeName */,
       const apache::thrift::CompactSerializer& serializer) {
-    RouteMap routeMap;
-
     auto maybeRouteDb =
         decisionPub.recvThriftObj<thrift::RouteDatabase>(serializer);
     EXPECT_FALSE(maybeRouteDb.hasError());
     auto routeDb = maybeRouteDb.value();
-
-    fillRouteMap(myNodeName, routeMap, routeDb);
-    VLOG(4) << "---";
-
-    return routeMap;
+    return routeDb;
   }
 
   void
@@ -1284,7 +1401,11 @@ TEST_F(DecisionTestFixture, BasicOperations) {
       {});
 
   replyInitialSyncReq(publication);
-  auto routeMap = recvMyRouteMap(decisionPub, "1", serializer);
+  auto routeDb = recvMyRouteDb(decisionPub, "1", serializer);
+  EXPECT_EQ(1, routeDb.routes.size());
+  RouteMap routeMap;
+  fillRouteMap("1", routeMap, routeDb);
+
   EXPECT_EQ(
       routeMap[make_pair("1", toString(addr2))],
       NextHops({make_pair(toNextHop(adj12), 10)}));
@@ -1309,7 +1430,9 @@ TEST_F(DecisionTestFixture, BasicOperations) {
   // validate routers
 
   // receive my local Decision routeDb publication
-  routeMap = recvMyRouteMap(decisionPub, "1" /* node name */, serializer);
+  routeDb = recvMyRouteDb(decisionPub, "1" /* node name */, serializer);
+  EXPECT_EQ(2, routeDb.routes.size());
+  fillRouteMap("1", routeMap, routeDb);
   // 1
   EXPECT_EQ(
       routeMap[make_pair("1", toString(addr2))],
@@ -1320,7 +1443,12 @@ TEST_F(DecisionTestFixture, BasicOperations) {
       NextHops({make_pair(toNextHop(adj12), 20)}));
 
   // dump other nodes' routeDB
-  routeMap = dumpRouteMap(decisionReq, {"2", "3"}, serializer);
+  auto routeDbMap = dumpRouteDatabase(decisionReq, {"2", "3"}, serializer);
+  EXPECT_EQ(2, routeDbMap["2"].routes.size());
+  EXPECT_EQ(2, routeDbMap["3"].routes.size());
+  for (auto kv : routeDbMap) {
+    fillRouteMap(kv.first, routeMap, kv.second);
+  }
 
   // 2
   EXPECT_EQ(
@@ -1345,8 +1473,9 @@ TEST_F(DecisionTestFixture, BasicOperations) {
       FRAGILE, thrift::KeyVals{}, {"adj:3", "prefix:3"} /* expired keys */);
 
   publishRouteDb(publication);
-  routeMap = recvMyRouteMap(decisionPub, "1" /* node name */, serializer);
-  EXPECT_EQ(1, routeMap.size());
+  routeDb = recvMyRouteDb(decisionPub, "1" /* node name */, serializer);
+  EXPECT_EQ(1, routeDb.routes.size());
+  fillRouteMap("1", routeMap, routeDb);
   EXPECT_EQ(
       routeMap[make_pair("1", toString(addr2))],
       NextHops({make_pair(toNextHop(adj12), 10)}));
@@ -1374,14 +1503,16 @@ TEST_F(DecisionTestFixture, PubDebouncing) {
 
   auto counters = decision->getCounters();
   EXPECT_EQ(0, counters["decision.paths_build_requests.count.0"]);
+  EXPECT_EQ(0, counters["decision.route_build_requests.count.0"]);
   replyInitialSyncReq(publication);
 
   /* sleep override */
   // wait for SPF to finish
-  std::this_thread::sleep_for(spfTimeout / 2);
+  std::this_thread::sleep_for(debounceTimeout / 2);
   // validate SPF after initial sync, no rebouncing here
   counters = decision->getCounters();
   EXPECT_EQ(1, counters["decision.paths_build_requests.count.0"]);
+  EXPECT_EQ(1, counters["decision.route_build_requests.count.0"]);
 
   //
   // publish the link state info to KvStore via the KvStore pub socket
@@ -1403,31 +1534,105 @@ TEST_F(DecisionTestFixture, PubDebouncing) {
   // we simulate adding a new router R4
 
   // Some tricks here; we need to bump the time-stamp on router 3's data, so
-  // it can override existing; for router 4 we publish new key-value
+  // it can override existing;
 
   publication = thrift::Publication(
       FRAGILE,
       {{"adj:4", createAdjValue("4", 1, {adj43})},
-       {"adj:3", createAdjValue("3", 5, {adj32, adj34})},
-       {"prefix:4", createPrefixValue("4", 1, {addr4})}},
+       {"adj:3", createAdjValue("3", 5, {adj32, adj34})}},
       {});
 
   publishRouteDb(publication);
 
   /* sleep override */
   // wait long enough for SPF to finish if it is called and short enoughs
-  // before deboucing timer spfTimeout expires
-  std::this_thread::sleep_for(spfTimeout / 20);
+  // before deboucing timer debounceTimeout expires
+  std::this_thread::sleep_for(debounceTimeout / 20);
   // validate SPF: shall not have run here
   counters = decision->getCounters();
   EXPECT_EQ(1, counters["decision.paths_build_requests.count.0"]);
+  EXPECT_EQ(1, counters["decision.route_build_requests.count.0"]);
 
   /* sleep override */
   // wait for debouncing to kick in
-  std::this_thread::sleep_for(spfTimeout);
+  std::this_thread::sleep_for(debounceTimeout);
   // validate SPF
   counters = decision->getCounters();
   EXPECT_EQ(2, counters["decision.paths_build_requests.count.0"]);
+  EXPECT_EQ(2, counters["decision.route_build_requests.count.0"]);
+
+  //
+  // Only publish prefix updates
+  //
+  publication = thrift::Publication(
+      FRAGILE,
+      {{"prefix:4", createPrefixValue("4", 1, {addr4})}},
+      {});
+  publishRouteDb(publication);
+
+  /* sleep override */
+  // wait for route rebuilding to finish
+  std::this_thread::sleep_for(debounceTimeout / 2);
+  counters = decision->getCounters();
+  EXPECT_EQ(2, counters["decision.paths_build_requests.count.0"]);
+  EXPECT_EQ(3, counters["decision.route_build_requests.count.0"]);
+
+  //
+  // publish adj updates right after prefix updates
+  // Decision is supposed to only trigger spf recalculation
+
+  // Some tricks here; we need to bump the time-stamp on router 4's data, so
+  // it can override existing;
+  publication = thrift::Publication(
+      FRAGILE,
+      {{"prefix:4", createPrefixValue("4", 2, {addr4, addr5})}},
+      {});
+  publishRouteDb(publication);
+
+  publication = thrift::Publication(
+      FRAGILE,
+      {{"adj:2", createAdjValue("2", 5, {adj21})}},
+      {});
+  publishRouteDb(publication);
+
+  /* sleep override */
+  // wait for SPF to finish
+  std::this_thread::sleep_for(debounceTimeout);
+  counters = decision->getCounters();
+  EXPECT_EQ(3, counters["decision.paths_build_requests.count.0"]);
+  EXPECT_EQ(4, counters["decision.route_build_requests.count.0"]);
+
+  //
+  // publish multiple prefix updates in a row
+  // Decision is supposed to process prefix update only once
+
+  // Some tricks here; we need to bump the time-stamp on router 4's data, so
+  // it can override existing;
+  publication = thrift::Publication(
+      FRAGILE,
+      {{"prefix:4", createPrefixValue("4", 5, {addr4})}},
+      {});
+  publishRouteDb(publication);
+
+  publication = thrift::Publication(
+      FRAGILE,
+      {{"prefix:4", createPrefixValue("4", 7, {addr4, addr6})}},
+      {});
+  publishRouteDb(publication);
+
+  publication = thrift::Publication(
+      FRAGILE,
+      {{"prefix:4", createPrefixValue("4", 8, {addr4, addr5, addr6})}},
+      {});
+  publishRouteDb(publication);
+
+  /* sleep override */
+  // wait for route rebuilding to finish
+  std::this_thread::sleep_for(debounceTimeout);
+  counters = decision->getCounters();
+  EXPECT_EQ(3, counters["decision.paths_build_requests.count.0"]);
+  // only 1 request shall be processed
+  EXPECT_EQ(5, counters["decision.route_build_requests.count.0"]);
 }
 
 //
@@ -1455,7 +1660,7 @@ TEST_F(DecisionTestFixture, NoSpfOnIrrelevantPublication) {
 
   // wait for SPF to finish
   /* sleep override */
-  std::this_thread::sleep_for(2 * spfTimeout);
+  std::this_thread::sleep_for(2 * debounceTimeout);
 
   // make sure the counter did not increment
   counters = decision->getCounters();
@@ -1487,7 +1692,7 @@ TEST_F(DecisionTestFixture, NoSpfOnDuplicatePublication) {
 
   // wait for SPF to finish
   /* sleep override */
-  std::this_thread::sleep_for(2 * spfTimeout);
+  std::this_thread::sleep_for(2 * debounceTimeout);
 
   // make sure counter is incremented
   counters = decision->getCounters();
@@ -1498,7 +1703,7 @@ TEST_F(DecisionTestFixture, NoSpfOnDuplicatePublication) {
 
   // wait for SPF to finish
   /* sleep override */
-  std::this_thread::sleep_for(2 * spfTimeout);
+  std::this_thread::sleep_for(2 * debounceTimeout);
 
   // make sure counter is not incremented
   counters = decision->getCounters();
@@ -1515,12 +1720,18 @@ TEST_F(DecisionTestFixture, NoSpfOnDuplicatePublication) {
  */
 TEST_F(DecisionTestFixture, LoopFreeAlternatePaths) {
   // Note: local copy overwriting global ones, to be changed in this test
-  auto adj12 = createAdjacency("2", "1/2", "fe80::2", "192.168.0.2", 10, 0);
-  auto adj13 = createAdjacency("3", "1/3", "fe80::3", "192.168.0.3", 8, 0);
-  auto adj21 = createAdjacency("1", "2/1", "fe80::1", "192.168.0.1", 10, 0);
-  auto adj23 = createAdjacency("3", "2/3", "fe80::3", "192.168.0.3", 9, 0);
-  auto adj31 = createAdjacency("1", "3/1", "fe80::1", "192.168.0.1", 8, 0);
-  auto adj32 = createAdjacency("2", "3/2", "fe80::2", "192.168.0.2", 9, 0);
+  auto adj12 =
+      createAdjacency("2", "1/2", "2/1", "fe80::2", "192.168.0.2", 10, 0);
+  auto adj13 =
+      createAdjacency("3", "1/3", "3/1", "fe80::3", "192.168.0.3", 8, 0);
+  auto adj21 =
+      createAdjacency("1", "2/1", "1/2", "fe80::1", "192.168.0.1", 10, 0);
+  auto adj23 =
+      createAdjacency("3", "2/3", "3/2", "fe80::3", "192.168.0.3", 9, 0);
+  auto adj31 =
+      createAdjacency("1", "3/1", "1/3", "fe80::1", "192.168.0.1", 8, 0);
+  auto adj32 =
+      createAdjacency("2", "3/2", "2/3", "fe80::2", "192.168.0.2", 9, 0);
 
   //
   // publish initial link state info to KvStore, This should trigger the
@@ -1540,7 +1751,12 @@ TEST_F(DecisionTestFixture, LoopFreeAlternatePaths) {
   replyInitialSyncReq(publication);
 
   // validate routers
-  auto routeMap = dumpRouteMap(decisionReq, {"1", "2", "3"}, serializer);
+  auto routeMapList =
+      dumpRouteDatabase(decisionReq, {"1", "2", "3"}, serializer);
+  RouteMap routeMap;
+  for (auto kv : routeMapList) {
+    fillRouteMap(kv.first, routeMap, kv.second);
+  }
   // 1
   EXPECT_EQ(
       routeMap[make_pair("1", toString(addr2))],
@@ -1596,11 +1812,15 @@ TEST_F(DecisionTestFixture, LoopFreeAlternatePaths) {
 
   // wait for SPF to finish
   /* sleep override */
-  std::this_thread::sleep_for(2 * spfTimeout);
+  std::this_thread::sleep_for(2 * debounceTimeout);
 
   // Query new information
   // validate routers
-  routeMap = dumpRouteMap(decisionReq, {"1", "2", "3"}, serializer);
+  routeMapList = dumpRouteDatabase(decisionReq, {"1", "2", "3"}, serializer);
+  routeMap.clear();
+  for (auto kv : routeMapList) {
+    fillRouteMap(kv.first, routeMap, kv.second);
+  }
 
   // 1
   EXPECT_EQ(
@@ -1647,8 +1867,10 @@ TEST_F(DecisionTestFixture, LoopFreeAlternatePaths) {
  */
 TEST_F(DecisionTestFixture, DuplicatePrefixes) {
   // Note: local copy overwriting global ones, to be changed in this test
-  auto adj12 = createAdjacency("2", "1/2", "fe80::2", "192.168.0.2", 10, 0);
-  auto adj21 = createAdjacency("1", "2/1", "fe80::1", "192.168.0.1", 10, 0);
+  auto adj12 =
+      createAdjacency("2", "1/2", "2/1", "fe80::2", "192.168.0.2", 10, 0);
+  auto adj21 =
+      createAdjacency("1", "2/1", "1/2", "fe80::1", "192.168.0.1", 10, 0);
 
   //
   // publish initial link state info to KvStore, This should trigger the
@@ -1669,25 +1891,33 @@ TEST_F(DecisionTestFixture, DuplicatePrefixes) {
 
   // wait for SPF to finish
   /* sleep override */
-  std::this_thread::sleep_for(2 * spfTimeout);
+  std::this_thread::sleep_for(2 * debounceTimeout);
 
   // Query new information
   // validate routers
-  auto routeMap = dumpRouteMap(decisionReq, {"1", "2", "3"}, serializer);
-  EXPECT_EQ(3, routeMap.size()); // 1 route per neighbor
+  auto routeMapList =
+      dumpRouteDatabase(decisionReq, {"1", "2", "3"}, serializer);
+  EXPECT_EQ(3, routeMapList.size()); // 1 route per neighbor
+  RouteMap routeMap;
+  for (auto kv : routeMapList) {
+    fillRouteMap(kv.first, routeMap, kv.second);
+  }
 
   // 1
+  EXPECT_EQ(1, routeMapList["1"].routes.size());
   EXPECT_EQ(
       routeMap[make_pair("1", toString(addr2))],
       NextHops(
           {make_pair(toNextHop(adj12), 10), make_pair(toNextHop(adj13), 10)}));
 
   // 2
+  EXPECT_EQ(1, routeMapList["2"].routes.size());
   EXPECT_EQ(
       routeMap[make_pair("2", toString(addr1))],
       NextHops({make_pair(toNextHop(adj21), 10)}));
 
   // 3
+  EXPECT_EQ(1, routeMapList["3"].routes.size());
   EXPECT_EQ(
       routeMap[make_pair("3", toString(addr1))],
       NextHops({make_pair(toNextHop(adj31), 10)}));
@@ -1717,25 +1947,32 @@ TEST_F(DecisionTestFixture, DuplicatePrefixes) {
 
   // wait for SPF to finish
   /* sleep override */
-  std::this_thread::sleep_for(2 * spfTimeout);
+  std::this_thread::sleep_for(2 * debounceTimeout);
 
   // Query new information
   // validate routers
-  routeMap = dumpRouteMap(decisionReq, {"1", "2", "3"}, serializer);
-  EXPECT_EQ(3, routeMap.size()); // 1 route per neighbor
+  routeMapList = dumpRouteDatabase(decisionReq, {"1", "2", "3"}, serializer);
+  EXPECT_EQ(3, routeMapList.size()); // 1 route per neighbor
+  routeMap.clear();
+  for (auto kv : routeMapList) {
+    fillRouteMap(kv.first, routeMap, kv.second);
+  }
 
   // 1
+  EXPECT_EQ(1, routeMapList["1"].routes.size());
   EXPECT_EQ(
       routeMap[make_pair("1", toString(addr2))],
       NextHops(
           {make_pair(toNextHop(adj12), 100), make_pair(toNextHop(adj13), 10)}));
 
   // 2
+  EXPECT_EQ(1, routeMapList["2"].routes.size());
   EXPECT_EQ(
       routeMap[make_pair("2", toString(addr1))],
       NextHops({make_pair(toNextHop(adj21), 100)}));
 
   // 3
+  EXPECT_EQ(1, routeMapList["3"].routes.size());
   EXPECT_EQ(
       routeMap[make_pair("3", toString(addr1))],
       NextHops({make_pair(toNextHop(adj31), 10)}));
@@ -1773,6 +2010,7 @@ TEST_F(DecisionTestFixture, DecisionSubReliability) {
       auto adj = createAdjacency(
           dst,
           folly::sformat("{}/{}", src, dst),
+          folly::sformat("{}/{}", dst, src),
           folly::sformat("fe80::{}", dst),
           "192.168.0.1" /* unused */,
           10 /* metric */,
@@ -1802,7 +2040,7 @@ TEST_F(DecisionTestFixture, DecisionSubReliability) {
   while (true) {
     auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start);
-    if (diff > (3 * spfTimeout)) {
+    if (diff > (3 * debounceTimeout)) {
       LOG(INFO) << "Hammered decision with " << totalSent
                 << " updates. Stopping";
       break;
@@ -1812,31 +2050,35 @@ TEST_F(DecisionTestFixture, DecisionSubReliability) {
   }
 
   // Receive RouteUpdate from Decision
-  auto routes1 = recvMyRouteMap(decisionPub, "1", serializer);
-  EXPECT_EQ(999, routes1.size()); // Route to all nodes except mine
+  auto routes1 = recvMyRouteDb(decisionPub, "1", serializer);
+  EXPECT_EQ(999, routes1.routes.size()); // Route to all nodes except mine
 
   //
-  // Now advertise one more update to trigger SPF run. Decision gonna take some
+  // Wait until all pending updates are finished
+  //
+  std::this_thread::sleep_for(std::chrono::seconds(30));
+
+  //
+  // Advertise prefix update. Decision gonna take some
   // good amount of time to process this last update (as it has many queued
   // updates).
   //
   thrift::Publication newPub;
   auto newAddr = toIpPrefix("face:b00c:babe::1/128");
   newPub.keyVals["prefix:1"] = createPrefixValue("1", 2, {newAddr});
-  LOG(INFO) << "Advertising new update to trigger SPF run.";
+  LOG(INFO) << "Advertising prefix update";
   publishRouteDb(newPub);
-
-  // Receive another RouteUpdate from Decision
-  auto routes2 = recvMyRouteMap(decisionPub, "1", serializer);
-  EXPECT_EQ(999, routes2.size()); // Route to all nodes except mine
-
+  // Receive RouteUpdate from Decision
+  auto routes2 = recvMyRouteDb(decisionPub, "1", serializer);
+  EXPECT_EQ(999, routes2.routes.size()); // Route to all nodes except mine
   //
   // Verify counters information
   //
+
   const int64_t adjUpdateCnt = 1000 /* initial */;
   const int64_t prefixUpdateCnt = totalSent + 1000 /* initial */ + 1 /* end */;
   auto counters = decision->getCounters();
-  EXPECT_EQ(2, counters["decision.paths_build_requests.count.0"]);
+  EXPECT_EQ(1, counters["decision.paths_build_requests.count.0"]);
   EXPECT_EQ(adjUpdateCnt, counters["decision.adj_db_update.count.0"]);
   EXPECT_EQ(prefixUpdateCnt, counters["decision.prefix_db_update.count.0"]);
 }

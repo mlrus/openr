@@ -39,8 +39,8 @@ class ConfigPrefixAllocatorCmd(ConfigCmd):
         try:
             prefix_alloc_blob = self.client.load(Consts.PREFIX_ALLOC_KEY)
         except KeyError:
-            print("Cannot load Prefix Allocator config")
-            sys.exit(1)
+            print("Missing Prefix Allocator config", file=sys.stderr)
+            return
 
         prefix_alloc = deserialize_thrift_object(
             prefix_alloc_blob, ap_types.AllocPrefix)
@@ -67,8 +67,8 @@ class ConfigLinkMonitorCmd(ConfigCmd):
         try:
             lm_config_blob = self.client.load(Consts.LINK_MONITOR_KEY)
         except KeyError:
-            print("Cannot load Link Monitor config")
-            sys.exit(1)
+            print("Missing Link Monitor config", file=sys.stderr)
+            return
 
         lm_config = deserialize_thrift_object(
             lm_config_blob, lm_types.LinkMonitorConfig)
@@ -97,19 +97,17 @@ class ConfigPrefixManagerCmd(ConfigCmd):
         try:
             prefix_mgr_config_blob = self.client.load(Consts.PREFIX_MGR_KEY)
         except KeyError:
-            print("Cannot load Prefix Manager config")
-            sys.exit(1)
+            print("Missing Prefix Manager config", file=sys.stderr)
+            return
 
         prefix_mgr_config = deserialize_thrift_object(
             prefix_mgr_config_blob, lsdb_types.PrefixDatabase)
         self.print_config(prefix_mgr_config)
 
     def print_config(self, prefix_mgr_config):
-        prefix_strs = utils.sprint_prefixes_db_full(prefix_mgr_config)
-
-        caption = 'Prefix Manager parameters stored'
-        print(printing.render_horizontal_table(
-            [['\n'.join(prefix_strs)]], caption=caption, tablefmt='plain'))
+        print()
+        print(utils.sprint_prefixes_db_full(prefix_mgr_config))
+        print()
 
 
 class ConfigEraseCmd(ConfigCmd):
@@ -123,9 +121,7 @@ class ConfigEraseCmd(ConfigCmd):
 
 
 class ConfigStoreCmd(ConfigCmd):
-    def run(self, key, file):
-        with open(file, 'r') as f:
-            value = f.read()
+    def run(self, key, value):
         success = self.client.store(key, value)
         if success:
             print("Key stored\n")

@@ -32,12 +32,7 @@ using apache::thrift::FRAGILE;
 
 namespace {
 
-const std::string kLinkMonitorId = "LinkMonitor";
-const auto kMulticastPrefixV6 = folly::IPAddress::createNetwork("ff00::/8");
-const std::chrono::seconds kIfUpRetryInterval{10};
-const std::chrono::milliseconds kMinIfSyncBackOff{8};
-const std::chrono::milliseconds kMaxIfSyncBackOff{8192};
-const std::string kNodeLabelRangePrefix = "nodeLabel:";
+const std::chrono::seconds kIfUpRetryInterval{60};
 const std::string kConfigKey{"link-monitor-config"};
 
 /**
@@ -84,12 +79,14 @@ LinkMonitor::LinkMonitor(
     KvStoreLocalPubUrl kvStoreLocalPubUrl,
     std::vector<std::regex> const& includeRegexList,
     std::vector<std::regex> const& excludeRegexList,
-    std::set<std::string> const& redistIfNames,
+    std::vector<std::regex> const& redistRegexList,
     std::vector<thrift::IpPrefix> const& staticPrefixes,
     bool useRttMetric,
     bool enableFullMeshReduction,
     bool enablePerfMeasurement,
     bool enableV4,
+    bool advertiseInterfaceDb,
+    bool enableSegmentRouting,
     AdjacencyDbMarker adjacencyDbMarker,
     InterfaceDbMarker interfaceDbMarker,
     SparkCmdUrl sparkCmdUrl,
@@ -112,12 +109,14 @@ LinkMonitor::LinkMonitor(
       kvStoreLocalPubUrl_(kvStoreLocalPubUrl),
       includeRegexList_(includeRegexList),
       excludeRegexList_(excludeRegexList),
-      redistIfNames_(redistIfNames),
+      redistRegexList_(redistRegexList),
       staticPrefixes_(staticPrefixes),
       useRttMetric_(useRttMetric),
       enableFullMeshReduction_(enableFullMeshReduction),
       enablePerfMeasurement_(enablePerfMeasurement),
       enableV4_(enableV4),
+      advertiseInterfaceDb_(advertiseInterfaceDb),
+      enableSegmentRouting_(enableSegmentRouting),
       adjacencyDbMarker_(adjacencyDbMarker),
       interfaceDbMarker_(interfaceDbMarker),
       sparkCmdUrl_(sparkCmdUrl),
@@ -128,13 +127,15 @@ LinkMonitor::LinkMonitor(
       // mutable states
       flapInitialBackoff_(flapInitialBackoff),
       flapMaxBackoff_(flapMaxBackoff),
-      linkMonitorPubSock_(zmqContext),
+      linkMonitorPubSock_(
+          zmqContext, folly::none, folly::none, fbzmq::NonblockingFlag{true}),
       linkMonitorCmdSock_(
           zmqContext, folly::none, folly::none, fbzmq::NonblockingFlag{true}),
       sparkCmdSock_(zmqContext),
       sparkReportSock_(zmqContext),
-      nlEventSub_(zmqContext),
-      expBackoff_(kMinIfSyncBackOff, kMaxIfSyncBackOff) {
+      nlEventSub_(
+          zmqContext, folly::none, folly::none, fbzmq::NonblockingFlag{true}),
+      expBackoff_(Constants::kInitialBackoff, Constants::kMaxBackoff) {
   // Create throttled adjacency advertiser
   advertiseMyAdjacenciesThrottled_ = std::make_unique<fbzmq::ZmqThrottle>(
       this, Constants::kLinkThrottleTimeout, [this]() noexcept {
@@ -175,35 +176,28 @@ LinkMonitor::LinkMonitor(
       kvStoreLocalPubUrl_,
       folly::none /* recv timeout */);
 
-  // create range allocator to get unique node labels
-  rangeAllocator_ = std::make_unique<RangeAllocator<int32_t>>(
-      nodeId_,
-      kNodeLabelRangePrefix,
-      kvStoreClient_.get(),
-      [&](folly::Optional<int32_t> newVal) noexcept {
-        config_.nodeLabel = newVal ? newVal.value() : 0;
-        advertiseMyAdjacencies();
-      },
-      std::chrono::milliseconds(100),
-      std::chrono::seconds(2),
-      false /* override owner */);
+  if (enableSegmentRouting) {
+    // create range allocator to get unique node labels
+    rangeAllocator_ = std::make_unique<RangeAllocator<int32_t>>(
+        nodeId_,
+        Constants::kNodeLabelRangePrefix,
+        kvStoreClient_.get(),
+        [&](folly::Optional<int32_t> newVal) noexcept {
+          config_.nodeLabel = newVal ? newVal.value() : 0;
+          advertiseMyAdjacencies();
+        },
+        std::chrono::milliseconds(100),
+        std::chrono::seconds(2),
+        false /* override owner */);
 
-  // Delay range allocation until we have formed all of our adjcencies
-  scheduleTimeoutAt(adjHoldUntilTimePoint_, [this]() {
-    folly::Optional<int32_t> initValue;
-    if (config_.nodeLabel != 0) {
-      initValue = config_.nodeLabel;
-    }
-    rangeAllocator_->startAllocator(Constants::kSrGlobalRange, initValue);
-  });
-
-  // Make thrift calls to do real programming
-  try {
-    createNetlinkSystemHandlerClient();
-  } catch (const std::exception& e) {
-    client_.reset();
-    LOG(ERROR) << "Failed to make thrift call to Switch Agent. Error: "
-               << folly::exceptionStr(e);
+    // Delay range allocation until we have formed all of our adjcencies
+    scheduleTimeoutAt(adjHoldUntilTimePoint_, [this]() {
+      folly::Optional<int32_t> initValue;
+      if (config_.nodeLabel != 0) {
+        initValue = config_.nodeLabel;
+      }
+      rangeAllocator_->startAllocator(Constants::kSrGlobalRange, initValue);
+    });
   }
 
   // Initialize ZMQ sockets
@@ -286,8 +280,6 @@ LinkMonitor::prepare() noexcept {
     LOG(FATAL) << "Error connecting to URL '" << platformPubUrl_ << "' "
                << nlSub.error();
   }
-
-  syncInterfaces();
 
   // Listen for messages from spark
   addSocket(
@@ -482,8 +474,8 @@ LinkMonitor::prepare() noexcept {
               << expBackoff_.getTimeRemainingUntilRetry().count() << " ms";
     }
   });
-  // schedule immediate
-  interfaceDbSyncTimer_->scheduleTimeout(std::chrono::milliseconds(0));
+  // schedule immediate with small timeout
+  interfaceDbSyncTimer_->scheduleTimeout(std::chrono::milliseconds(100));
 
   sendIfDbTimer_ =
       fbzmq::ZmqTimeout::make(this, [this]() noexcept { sendIfDbCallback(); });
@@ -530,7 +522,7 @@ LinkMonitor::neighborUpEvent(
       toBinaryAddress(neighborAddrV6) /* nextHopV6 */,
       toBinaryAddress(neighborAddrV4) /* nextHopV4 */,
       (useRttMetric_ ? rttMetric : 1) /* metric */,
-      event.label /* adjacency-label */,
+      enableSegmentRouting_ ? event.label : 0 /* adjacency-label */,
       false /* overload bit */,
       event.rttUs,
       timestamp,
@@ -825,6 +817,7 @@ LinkMonitor::createInterfaceDatabase() {
 
 void
 LinkMonitor::sendInterfaceDatabase() {
+
   const auto ifDb = createInterfaceDatabase();
 
   // advertise interface database, prompting FIB to take immediate action
@@ -845,6 +838,11 @@ LinkMonitor::sendInterfaceDatabase() {
       sparkCmdSock_.recvThriftObj<thrift::SparkIfDbUpdateResult>(serializer_);
   if (result.hasError()) {
     LOG(ERROR) << "Failed updating interface to Spark " << result.error();
+  }
+
+  // Return immediately if we are not configured to advertise interface db
+  if (not advertiseInterfaceDb_) {
+    return;
   }
 
   // advertise link database in KvStore
@@ -995,7 +993,7 @@ LinkMonitor::processAddrEvent(const thrift::AddrEntry& addrEntry) {
   const std::string& ifName = addrEntry.ifName;
 
   // Add address if it is supposed to be announced
-  if (redistIfNames_.count(ifName)) {
+  if (checkRedistIfNameRegex(ifName)) {
     addDelRedistAddr(ifName, addrEntry.isValid, addrEntry.ipPrefix);
   }
 
@@ -1028,24 +1026,13 @@ LinkMonitor::processAddrEvent(const thrift::AddrEntry& addrEntry) {
   }
 }
 
-//
-// Add interfaces in the system to the spark (URL is provided)
-//
 bool
 LinkMonitor::syncInterfaces() {
+  VLOG(2) << "Syncing Interface DB from Netlink Platform";
+
   //
-  // Discover existing interfaces and start Spark sessions on those
-  // that are up. Interface name must match the specified prefix
-  // NOTE:
-  // This may trigger our processLinkEvent/processAddrEvent handler to be
-  // invoked as it is registered handler with netlink and we are requesting
-  // a full update from kernel. This is ok.
-  // We check for redundant notifications
+  // Retrieve latest link snapshot from SystemService
   //
-  // We can also use this method for periodic re-syncs
-  //
-  std::set<std::string> updatedInterfaces;
-  VLOG(2) << "Creating client to dispatch query to Netlink Platform";
   std::vector<thrift::Link> links;
   try {
     createNetlinkSystemHandlerClient();
@@ -1057,78 +1044,29 @@ LinkMonitor::syncInterfaces() {
     return false;
   }
 
-  VLOG(2) << "Syncing Interface DB from Netlink Platform";
+  //
+  // Process received data. We convert received data to link and addr events
+  // and invoke our processLinkEntry and processAddrEntry handlers
+  //
   for (const auto& link : links) {
-    const std::string& ifName = link.ifName;
+    // Process link entry
+    const thrift::LinkEntry linkEntry(
+        apache::thrift::FRAGILE,
+        link.ifName,
+        link.ifIndex,
+        link.isUp,
+        link.weight);
+    processLinkEvent(linkEntry);
 
-    // Add address if it is supposed to be announced
-    if (redistIfNames_.count(ifName)) {
-      if (!link.isUp and redistAddrs_.erase(ifName)) {
-        advertiseRedistAddrs();
-      } else {
-        for (auto const& network : link.networks) {
-          addDelRedistAddr(ifName, true, network);
-        }
-      }
+    // Process each addr entry
+    for (const auto& network : link.networks) {
+      const thrift::AddrEntry addrEntry(
+          apache::thrift::FRAGILE,
+          link.ifName,
+          network,
+          true /* is valid */);
+      processAddrEvent(addrEntry);
     }
-
-    if (!checkIncludeExcludeRegex(
-            ifName, includeRegexList_, excludeRegexList_)) {
-      VLOG(5) << "Interface " << ifName << " does not match iface regexes";
-      continue;
-    }
-
-    bool isUp = link.isUp;
-    int ifIndex = link.ifIndex;
-    uint64_t weight = link.weight;
-    std::unordered_set<folly::IPAddress> v4Addrs;
-    std::unordered_set<folly::IPAddress> v6LinkLocalAddrs;
-
-    const auto& networks = link.networks;
-    for (const auto& network : networks) {
-      // copy the ipAddr, we move it if we use it
-      auto ipAddr = toIPAddress(network.prefixAddress);
-      if (ipAddr.isV4()) {
-        v4Addrs.emplace(std::move(ipAddr));
-        continue;
-      }
-      if (ipAddr.isV6() && ipAddr.isLinkLocal()) {
-        v6LinkLocalAddrs.emplace(std::move(ipAddr));
-        continue;
-      }
-    }
-
-    InterfaceEntry newIfEntry(
-        ifIndex, isUp, weight, std::move(v4Addrs), std::move(v6LinkLocalAddrs));
-
-    // Interface does not exist
-    if (!interfaceDb_.count(ifName)) {
-      interfaceDb_.emplace(ifName, std::move(newIfEntry));
-      LOG(INFO) << "Added " << ifName << " : " << interfaceDb_.at(ifName);
-      updatedInterfaces.insert(ifName);
-    } else {
-      // We are a refresh sync
-      // Check if anything differs and warn and update else skip.
-      // If all same then just continue
-      if (newIfEntry == interfaceDb_.at(ifName)) {
-        VLOG(3) << "No change to Interface " << ifName << " : "
-                << interfaceDb_.at(ifName);
-        continue;
-      }
-
-      // This is an update
-      LOG(WARNING) << "Re-syncing " << ifName << " : "
-                   << interfaceDb_.at(ifName);
-      interfaceDb_[ifName] = std::move(newIfEntry);
-      updatedInterfaces.insert(ifName);
-    }
-  }
-
-  // Send an update only if there is an update
-  if (!updatedInterfaces.empty()) {
-    LOG(INFO) << "Completed sync of Interface DB from netlink for: "
-              << folly::join(", ", updatedInterfaces);
-    sendInterfaceDatabase();
   }
 
   return true;
@@ -1147,7 +1085,7 @@ LinkMonitor::processCommand() {
   // read actual request
   const auto maybeReq =
       linkMonitorCmdSock_.recvThriftObj<thrift::LinkMonitorRequest>(
-          serializer_, Constants::kReadTimeout);
+          serializer_);
   if (maybeReq.hasError()) {
     LOG(ERROR) << "Error receiving LinkMonitorRequest: " << maybeReq.error();
     return;
@@ -1178,8 +1116,9 @@ LinkMonitor::processCommand() {
     break;
 
   case thrift::LinkMonitorCommand::SET_LINK_OVERLOAD:
-    if (req.interfaceName.empty()) {
-      LOG(ERROR) << "Got link-overload request with empty interface name.";
+    if (0 == interfaceDb_.count(req.interfaceName)) {
+      LOG(ERROR) << "SET_LINK_OVERLOAD requested for unknown interface: "
+                 << req.interfaceName;
       break;
     }
     if (config_.overloadedLinks.count(req.interfaceName)) {
@@ -1202,8 +1141,9 @@ LinkMonitor::processCommand() {
     break;
 
   case thrift::LinkMonitorCommand::SET_LINK_METRIC:
-    if (req.interfaceName.empty()) {
-      LOG(ERROR) << "Got link-overload request with empty interface name.";
+    if (0 == interfaceDb_.count(req.interfaceName)) {
+      LOG(ERROR) << "SET_LINK_METRIC requested for unknown interface: "
+                 << req.interfaceName;
       break;
     }
     if (req.interfaceMetric < 1) {
@@ -1259,8 +1199,12 @@ LinkMonitor::processCommand() {
         folly::gen::as<
             std::unordered_map<std::string, thrift::InterfaceDetails>>();
 
-    linkMonitorCmdSock_.sendMore(clientIdMessage);
-    linkMonitorCmdSock_.sendThriftObj(reply, serializer_);
+    auto ret = linkMonitorCmdSock_.sendMultiple(
+        clientIdMessage,
+        fbzmq::Message::fromThriftObj(reply, serializer_).value());
+    if (ret.hasError()) {
+      LOG(ERROR) << "Error sending response. " << ret.error();
+    }
     break;
   }
 
@@ -1275,20 +1219,19 @@ void
 LinkMonitor::addDelRedistAddr(
     const std::string& ifName, bool isValid, const thrift::IpPrefix& prefix) {
   bool isUpdated = false;
-
+  // NOTE: this will mask the address.
+  auto const ipNetwork = toIPNetwork(prefix);
+  auto const ip = ipNetwork.first;
   // Ignore irrelevant ip addresses.
-  // NOTE: we only want to announce addresses not networks of an interface (
-  // hence prefixLength check)
-  auto const ip = toIPAddress(prefix.prefixAddress);
   if (ip.isLoopback() || ip.isLinkLocal() || ip.isMulticast() ||
-      (ip.isV4() && !enableV4_) ||
-      static_cast<uint8_t>(prefix.prefixLength) != ip.bitCount()) {
+      (ip.isV4() && !enableV4_)) {
     return;
   }
 
+  auto const prefixToInsert = toIpPrefix(ipNetwork);
   // If address is invalid then try to remove from list if it exists
   if (!isValid and redistAddrs_.count(ifName)) {
-    isUpdated |= redistAddrs_.at(ifName).erase(prefix) > 0;
+    isUpdated |= redistAddrs_.at(ifName).erase(prefixToInsert) > 0;
     if (!redistAddrs_.at(ifName).size()) {
       redistAddrs_.erase(ifName);
     }
@@ -1296,7 +1239,7 @@ LinkMonitor::addDelRedistAddr(
 
   // If address is valid then add it to list if it doesn't exists
   if (isValid) {
-    isUpdated = redistAddrs_[ifName].insert(prefix).second;
+    isUpdated = redistAddrs_[ifName].insert(prefixToInsert).second;
   }
 
   // Advertise updates if there is any change
@@ -1330,7 +1273,7 @@ LinkMonitor::advertiseRedistAddrs() {
 
 void
 LinkMonitor::submitCounters() {
-  VLOG(2) << "Submitting counters ... ";
+  VLOG(3) << "Submitting counters ... ";
 
   // Extract/build counters from thread-data
   auto counters = tData_.getCounters();
@@ -1341,6 +1284,9 @@ LinkMonitor::submitCounters() {
     auto& adj = kv.second.second;
     counters["link_monitor.metric." + adj.otherNodeName] = adj.metric;
   }
+
+  // Aliveness report counters
+  counters["link_monitor.aliveness"] = 1;
 
   // Prepare for submitting counters
   fbzmq::CounterMap submittingCounters = prepareSubmitCounters(counters);
@@ -1355,7 +1301,7 @@ LinkMonitor::logLinkEvent(const std::string& event, const std::string& iface) {
   sample.addString("event", event);
   sample.addString("entity", "LinkMonitor");
   sample.addString("node_name", nodeId_);
-  sample.addString("iface", iface);
+  sample.addString("interface", iface);
 
   zmqMonitorClient_->addEventLog(fbzmq::thrift::EventLog(
       apache::thrift::FRAGILE,
@@ -1389,6 +1335,16 @@ LinkMonitor::InterfaceEntry::getInterfaceInfo() const {
           folly::gen::as<std::vector>(),
       folly::gen::from(v6LinkLocalAddrs_) | folly::gen::map(toBinaryAddress) |
           folly::gen::as<std::vector>());
+}
+
+bool
+LinkMonitor::checkRedistIfNameRegex(const std::string& ifName) {
+  for (const auto& regex : redistRegexList_) {
+    if (std::regex_match(ifName, regex)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void

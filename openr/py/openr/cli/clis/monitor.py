@@ -11,68 +11,77 @@ from __future__ import unicode_literals
 from __future__ import division
 
 import click
-import zmq
-
-from thrift.protocol.TCompactProtocol import TCompactProtocolFactory
-from thrift.protocol.TJSONProtocol import TJSONProtocolFactory
 
 from openr.cli.commands import monitor
-from openr.utils.consts import Consts
-
-
-class MonitorContext(object):
-    def __init__(self, verbose, zmq_ctx, host, timeout,
-                 monitor_rep_port, lm_cmd_port, json):
-        '''
-            :param zmq_ctx: the ZMQ context to create zmq sockets
-            :param host string: the openr router host
-            :para json bool: whether to use JSON proto or Compact for thrift
-        '''
-
-        self.verbose = verbose
-        self.host = host
-        self.timeout = timeout
-        self.zmq_ctx = zmq_ctx
-
-        self.monitor_rep_port = monitor_rep_port
-        self.lm_cmd_port = lm_cmd_port
-
-        self.proto_factory = (TJSONProtocolFactory if json
-                              else TCompactProtocolFactory)
 
 
 class MonitorCli(object):
     def __init__(self):
         self.monitor.add_command(CountersCli().counters)
+        self.monitor.add_command(ForceCrashCli().force_crash)
+        self.monitor.add_command(MonitorSnoop().snoop)
+        self.monitor.add_command(MonitorLogs().logs)
 
     @click.group()
-    @click.option('--monitor_rep_port', default=Consts.MONITOR_REP_PORT,
-                  help='Monitor rep port')
-    @click.option('--json/--no-json', default=False,
-                  help='Use JSON serializer')
-    @click.option('--verbose/--no-verbose', default=False,
-                  help='Print verbose information')
+    @click.option('--monitor_rep_port', default=None, type=int, help='Monitor rep port')
     @click.pass_context
-    def monitor(ctx, monitor_rep_port, json, verbose):  # noqa: B902
+    def monitor(ctx, monitor_rep_port):  # noqa: B902
         ''' CLI tool to peek into Monitor module. '''
 
-        ctx.obj = MonitorContext(
-            verbose, zmq.Context(),
-            ctx.obj.hostname,
-            ctx.obj.timeout,
-            ctx.obj.ports_config.get('monitor_rep_port', None) or monitor_rep_port,
-            ctx.obj.ports_config.get('lm_cmd_port', None) or
-            Consts.LINK_MONITOR_CMD_PORT,
-            json)
+        if monitor_rep_port:
+            ctx.obj.monitor_rep_port = monitor_rep_port
 
 
 class CountersCli(object):
 
     @click.command()
+    @click.option('--json', is_flag=True, help='Output JSON object')
     @click.option('--prefix', default='',
                   help='Only show counters starting with prefix')
     @click.pass_obj
-    def counters(cli_opts, prefix):  # noqa: B902
+    def counters(cli_opts, prefix, json):  # noqa: B902
         ''' Fetch and display OpenR counters '''
 
-        monitor.CountersCmd(cli_opts).run(prefix)
+        monitor.CountersCmd(cli_opts).run(prefix, json)
+
+
+class ForceCrashCli(object):
+
+    @click.command(name='force-crash')
+    @click.option('--yes', '-y', is_flag=True,
+                  help='Assume yes (non-interactive)')
+    @click.pass_obj
+    def force_crash(cli_opts, yes):  # noqa: B902
+        ''' Trigger force crash of Open/R '''
+
+        monitor.ForceCrashCmd(cli_opts).run(yes)
+
+
+class MonitorSnoop(object):
+
+    @click.command()
+    @click.option('--log/--no-log', default=True,
+                  help='Snoop on log')
+    @click.option('--counters/--no-counters', default=True,
+                  help='Snoop on counters')
+    @click.option('--delta/--no-delta', default=True,
+                  help='Output incremental changes')
+    @click.option('--duration', default=0,
+                  help='How long to snoop for. Default is infinite')
+    @click.pass_obj
+    def snoop(cli_opts, log, counters, delta, duration):  # noqa: B902
+        ''' Print changed counters '''
+
+        monitor.SnoopCmd(cli_opts).run(log, counters, delta, duration)
+
+
+class MonitorLogs(object):
+
+    @click.command()
+    @click.option('--prefix', default="", help='Show log events')
+    @click.option('--json/--no-json', default=False, help='Dump in JSON format')
+    @click.pass_obj
+    def logs(cli_opts, prefix, json):  # noqa: B902
+        ''' Print log events '''
+
+        monitor.LogCmd(cli_opts).run(json)

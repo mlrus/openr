@@ -30,8 +30,8 @@ install_zstd() {
   fi
   cd zstd
   make
-  make install
-  ldconfig
+  sudo make install
+  sudo ldconfig
   popd
 }
 
@@ -43,8 +43,8 @@ install_mstch() {
   cd mstch
   cmake -DBUILD_SHARED_LIBS=ON -DCMAKE_CXX_FLAGS="-fPIC" .
   make
-  make install
-  ldconfig
+  sudo make install
+  sudo ldconfig
   popd
 }
 
@@ -56,6 +56,7 @@ install_wangle() {
   rev=$(find_github_hash facebook/wangle)
   cd wangle/wangle
   if [[ ! -z "$rev" ]]; then
+    git fetch origin
     git checkout "$rev"
   fi
   cmake \
@@ -63,8 +64,8 @@ install_wangle() {
     -DFOLLY_LIBRARY=$DESTDIR/usr/local/lib \
     -DBUILD_TESTS=OFF .
   make
-  make install
-  ldconfig
+  sudo make install
+  sudo ldconfig
   popd
 }
 
@@ -74,12 +75,13 @@ install_libzmq() {
     git clone https://github.com/zeromq/libzmq
   fi
   cd libzmq
+  git fetch origin
   git checkout v4.2.2
   ./autogen.sh
   ./configure
   make
-  make install
-  ldconfig
+  sudo make install
+  sudo ldconfig
   popd
 }
 
@@ -91,8 +93,8 @@ install_libsodium() {
   cd libsodium
   ./configure
   make
-  make install
-  ldconfig
+  sudo make install
+  sudo ldconfig
   popd
 }
 
@@ -104,13 +106,14 @@ install_folly() {
   rev=$(find_github_hash facebook/folly)
   cd folly/folly
   if [[ ! -z "$rev" ]]; then
+    git fetch origin
     git checkout "$rev"
   fi
   autoreconf -ivf
   ./configure LIBS="-lpthread"
   make
-  make install
-  ldconfig
+  sudo make install
+  sudo ldconfig
   popd
 }
 
@@ -122,14 +125,15 @@ install_fbthrift() {
   rev=$(find_github_hash facebook/fbthrift)
   cd fbthrift/build
   if [[ ! -z "$rev" ]]; then
+    git fetch origin
     git checkout "$rev"
   fi
   cmake -DBUILD_SHARED_LIBS=ON ..
   make
-  make install
-  ldconfig
+  sudo make install
+  sudo ldconfig
   cd ../thrift/lib/py
-  python setup.py install
+  sudo python setup.py install
   popd
 }
 
@@ -139,8 +143,9 @@ install_fbzmq() {
     git clone https://github.com/facebook/fbzmq.git
   fi
   rev=$(find_github_hash facebook/fbzmq)
-  cd fbzmq/fbzmq/build
+  cd fbzmq/build
   if [[ ! -z "$rev" ]]; then
+    git fetch origin
     git checkout "$rev"
   fi
   cmake \
@@ -149,12 +154,12 @@ install_fbzmq() {
     -DCMAKE_EXE_LINKER_FLAGS="-static" \
     -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
     -DBUILD_TESTS=OFF \
-    ..
+    ../fbzmq/
   make
-  make install
-  ldconfig
-  cd ../py
-  python setup.py install
+  sudo make install
+  sudo ldconfig
+  cd ../fbzmq/py
+  sudo python setup.py install
   popd
 }
 
@@ -164,12 +169,13 @@ install_glog() {
     git clone https://github.com/google/glog
   fi
   cd glog
+  git fetch origin
   git checkout v0.3.5
   set -eu && autoreconf -i
   ./configure
   make
-  make install
-  ldconfig
+  sudo make install
+  sudo ldconfig
   popd
 }
 
@@ -179,6 +185,7 @@ install_gflags() {
     git clone https://github.com/gflags/gflags
   fi
   cd gflags
+  git fetch origin
   git checkout v2.2.0
   if [[ ! -e "mybuild" ]]; then
     mkdir mybuild
@@ -186,8 +193,8 @@ install_gflags() {
   cd mybuild
   cmake -DBUILD_SHARED_LIBS=ON ..
   make
-  make install
-  ldconfig
+  sudo make install
+  sudo ldconfig
   popd
 }
 
@@ -197,17 +204,18 @@ install_gtest() {
     git clone https://github.com/google/googletest
   fi
   cd googletest
+  git fetch origin
   git checkout release-1.8.0
   cd googletest
   cmake .
   make
-  make install
-  ldconfig
+  sudo make install
+  sudo ldconfig
   cd ../googlemock
   cmake .
   make
-  make install
-  ldconfig
+  sudo make install
+  sudo ldconfig
   popd
 }
 
@@ -216,6 +224,7 @@ install_libnl() {
   if [[ ! -e "libnl" ]]; then
     git clone https://github.com/thom311/libnl
     cd libnl
+    git fetch origin
     git checkout libnl3_2_25
     git apply ../../fix-route-obj-attr-list.patch
     cd ..
@@ -224,8 +233,8 @@ install_libnl() {
   ./autogen.sh
   ./configure
   make
-  make install
-  ldconfig
+  sudo make install
+  sudo ldconfig
   popd
 }
 
@@ -239,11 +248,11 @@ install_openr() {
     -DCMAKE_CXX_FLAGS="-Wno-unused-parameter" \
     ../openr/
   make
-  make install
-  chmod +x "/usr/local/sbin/run_openr.sh"
+  sudo make install
+  sudo chmod +x "/usr/local/sbin/run_openr.sh"
   cd "$BUILD_DIR/../openr/py"
-  pip install cffi
-  pip install future
+  sudo pip install cffi
+  sudo pip install future
   python setup.py build
   sudo python setup.py install
   cd "$BUILD_DIR"
@@ -254,8 +263,8 @@ install_openr() {
 #
 # Install required tools and libraries via package managers
 #
-
-apt-get install libdouble-conversion-dev \
+sudo apt-get update
+sudo apt-get install -y libdouble-conversion-dev \
   libssl-dev \
   cmake \
   make \

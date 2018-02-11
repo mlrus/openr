@@ -67,15 +67,13 @@ bool checkIncludeExcludeRegex(
 
 /**
  * @param prefixIndex subprefix index, starting from 0
- * @param mask apply mask to the IP portion
  * @return n-th subprefix of allocated length in seed prefix
  * note: only handle IPv6 and assume seed prefix comes unmasked
  */
 folly::CIDRNetwork getNthPrefix(
     const folly::CIDRNetwork& seedPrefix,
     uint32_t allocPrefixLen,
-    uint32_t prefixIndex,
-    bool mask);
+    uint32_t prefixIndex);
 
 // load key pair from file
 template <typename Serializer>
@@ -204,4 +202,13 @@ int64_t generateHash(
     const int64_t version,
     const std::string& originatorId,
     const folly::Optional<std::string>& value);
+
+/**
+ * TO BE DEPRECATED SOON: Backward compatible with empty remoteIfName
+ * Translate remote interface name from local interface name
+ * This is only applicable when remoteIfName is empty from peer adjacency update
+ * It returns remoteIfName if it is there else constructs one from localIfName
+ */
+std::string getRemoteIfName(
+  const thrift::Adjacency& adj);
 } // namespace openr

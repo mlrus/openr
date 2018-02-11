@@ -17,14 +17,16 @@ import hexdump
 import re
 import string
 import sys
+import time
 import zmq
 
 from itertools import combinations
+from openr.AllocPrefix import ttypes as alloc_types
 from openr.clients import kvstore_client, kvstore_subscriber
 from openr.cli.utils import utils
 from openr.utils.consts import Consts
 from openr.utils import printing
-from openr.utils.serializer import deserialize_thrift_object
+from openr.utils import serializer
 
 from openr.Lsdb import ttypes as lsdb_types
 from openr.KvStore import ttypes as kv_store_types
@@ -75,19 +77,40 @@ class KvStoreCmd(object):
 
             parse_func(container, value)
 
-    def get_node_list(self):
-        ''' get the set of all nodes in the network '''
+    def get_node_to_ips(self):
+        ''' get the dict of all nodes to their IP in the network '''
 
-        def _parse_nodes(node_set, value):
-            prefix_db = deserialize_thrift_object(
+        def _parse_nodes(node_dict, value):
+            prefix_db = serializer.deserialize_thrift_object(
                 value.value, lsdb_types.PrefixDatabase)
-            node_set.add(prefix_db.thisNodeName)
+            node_dict[prefix_db.thisNodeName] = self.get_node_ip(prefix_db)
 
-        node_set = set()
+        node_dict = {}
         resp = self.client.dump_all_with_prefix(Consts.PREFIX_DB_MARKER)
-        self.iter_publication(node_set, resp, ['all'], _parse_nodes)
+        self.iter_publication(node_dict, resp, ['all'], _parse_nodes)
 
-        return node_set
+        return node_dict
+
+    def get_node_ip(self, prefix_db):
+        '''
+        get routable IP address of node from it's prefix database
+        :return: string representation of Node's IP addresss. Returns None if
+                 no IP found.
+        '''
+
+        # First look for LOOPBACK prefix
+        for prefix_entry in prefix_db.prefixEntries:
+            if prefix_entry.type == lsdb_types.PrefixType.LOOPBACK:
+                return utils.sprint_addr(prefix_entry.prefix.prefixAddress.addr)
+
+        # Next look for PREFIX_ALLOCATOR prefix if any
+        for prefix_entry in prefix_db.prefixEntries:
+            if prefix_entry.type == lsdb_types.PrefixType.PREFIX_ALLOCATOR:
+                return utils.alloc_prefix_to_loopback_ip_str(
+                    prefix_entry.prefix)
+
+        # Else return None
+        return None
 
 
 class PrefixesCmd(KvStoreCmd):
@@ -100,16 +123,28 @@ class PrefixesCmd(KvStoreCmd):
 
 
 class KeysCmd(KvStoreCmd):
-    def run(self, prefix, ttl):
+    def run(self, json_fmt, prefix, ttl):
         resp = self.client.dump_key_with_prefix(prefix)
-        self.print_kvstore_keys(resp, ttl)
+        self.print_kvstore_keys(resp, ttl, json_fmt)
 
-    def print_kvstore_keys(self, resp, ttl):
+    def print_kvstore_keys(self, resp, ttl, json_fmt):
         ''' print keys from raw publication from KvStore
 
             :param resp kv_store_types.Publication: pub from kv store
             :param ttl bool: Show ttl value and version if True
         '''
+
+        # Force set value to None
+        for value in resp.keyVals.values():
+            value.value = None
+
+        # Export in json format if enabled
+        if json_fmt:
+            data = {}
+            for k, v in resp.keyVals.items():
+                data[k] = utils.thrift_to_dict(v)
+            print(utils.json_dumps(data))
+            return
 
         rows = []
         for key, value in sorted(resp.keyVals.items(), key=lambda x: x[0]):
@@ -132,29 +167,39 @@ class KeysCmd(KvStoreCmd):
 
 
 class KeyValsCmd(KvStoreCmd):
-    def run(self, keys):
+    def run(self, keys, json_fmt):
         resp = self.client.get_keys(keys)
-        self.print_kvstore_values(resp)
+        self.print_kvstore_values(resp, json_fmt)
 
     def deserialize_kvstore_publication(self, key, value):
         ''' classify kvstore prefix and return the corresponding deserialized obj '''
 
         options = {
             Consts.PREFIX_DB_MARKER: lsdb_types.PrefixDatabase,
-            Consts.ADJ_DB_MARKER: lsdb_types.AdjacencyDatabase
+            Consts.ADJ_DB_MARKER: lsdb_types.AdjacencyDatabase,
+            Consts.INTERFACE_DB_MARKER: lsdb_types.InterfaceDatabase,
         }
 
         prefix_type = key.split(':')[0] + ":"
         if prefix_type in options.keys():
-            return deserialize_thrift_object(value.value, options[prefix_type])
+            return serializer.deserialize_thrift_object(
+                value.value, options[prefix_type])
         else:
             return None
 
-    def print_kvstore_values(self, resp):
+    def print_kvstore_values(self, resp, json_fmt):
         ''' print values from raw publication from KvStore
 
             :param resp kv_store_types.Publication: pub from kv store
         '''
+
+        # Export in json format if enabled
+        if json_fmt:
+            data = {}
+            for k, v in resp.keyVals.items():
+                data[k] = utils.thrift_to_dict(v)
+            print(utils.json_dumps(data))
+            return
 
         rows = []
 
@@ -167,10 +212,11 @@ class KeyValsCmd(KvStoreCmd):
                 else:
                     val = hexdump.hexdump(value.value, 'return')
 
+            ttl = 'INF' if value.ttl == Consts.CONST_TTL_INF else value.ttl
             rows.append(["key: {}\n  version: {}\n  originatorId: {}\n  "
-                         "ttl: {}\n  ttlVersion: {}\n  value:\n    {}".format(
-                            key, value.version, value.originatorId, value.ttl,
-                            value.ttlVersion, val)])
+                         "ttl: {}\n  ttlVersion: {}\n  value:\n    {}"
+                         .format(key, value.version, value.originatorId, ttl,
+                                 value.ttlVersion, val)])
 
         caption = "Dump key-value pairs in KvStore"
         print(printing.render_vertical_table(rows, caption=caption))
@@ -189,14 +235,17 @@ class NodesCmd(KvStoreCmd):
         '''
 
         def _parse_nodes(rows, value):
-            prefix_db = deserialize_thrift_object(value.value,
-                                                  lsdb_types.PrefixDatabase)
-
-            prefix_strs = utils.sprint_prefixes_db_full(prefix_db, True)
-
+            prefix_db = serializer.deserialize_thrift_object(
+                value.value, lsdb_types.PrefixDatabase)
             marker = '* ' if prefix_db.thisNodeName == host_id else '> '
             row = ["{}{}".format(marker, prefix_db.thisNodeName)]
-            row.extend(prefix_strs)
+            loopback_prefixes = [
+                p.prefix for p in prefix_db.prefixEntries
+                if p.type == lsdb_types.PrefixType.LOOPBACK
+            ]
+            loopback_prefixes.sort(key=lambda x: len(x.prefixAddress.addr),
+                                   reverse=True)
+            row.extend([utils.sprint_prefix(p) for p in loopback_prefixes])
             rows.append(row)
 
         rows = []
@@ -228,35 +277,36 @@ class InterfacesCmd(KvStoreCmd):
         intfs_map = utils.interface_dbs_to_dict(publication, nodes,
                                                 self.iter_publication)
         if json:
-            print(json.dumps(intfs_map, sort_keys=True, indent=4))
+            print(utils.json_dumps(intfs_map))
         else:
             utils.print_interfaces_table(intfs_map, print_all)
 
 
 class KvCompareCmd(KvStoreCmd):
     def run(self, nodes):
+        all_nodes_to_ips = self.get_node_to_ips()
         if nodes:
             nodes = set(nodes.strip().split(','))
             if 'all' in nodes:
-                nodes = self.get_node_list()
+                nodes = all_nodes_to_ips.keys()
             host_id = utils.get_connected_node_name(self.host, self.lm_cmd_port)
             if host_id in nodes:
                 nodes.remove(host_id)
 
             our_kvs = self.client.dump_all_with_prefix().keyVals
-            kv_dict = self.dump_nodes_kvs(nodes)
+            kv_dict = self.dump_nodes_kvs(nodes, all_nodes_to_ips)
             for node in kv_dict:
                 self.compare(our_kvs, kv_dict[node], host_id, node)
 
         else:
-            nodes = self.get_node_list()
-            kv_dict = self.dump_nodes_kvs(nodes)
+            nodes = all_nodes_to_ips.keys()
+            kv_dict = self.dump_nodes_kvs(nodes, all_nodes_to_ips)
             for our_node, other_node in combinations(kv_dict.keys(), 2):
                 self.compare(kv_dict[our_node], kv_dict[other_node],
                              our_node, other_node)
 
     def compare(self, our_kvs, other_kvs, our_node, other_node):
-        ''' print kv delta'''
+        ''' print kv delta '''
 
         print(printing.caption_fmt(
               'kv-compare between {} and {}'.format(our_node, other_node)))
@@ -285,19 +335,19 @@ class KvCompareCmd(KvStoreCmd):
         ''' print db delta '''
 
         if key.startswith(Consts.PREFIX_DB_MARKER):
-            prefix_db = deserialize_thrift_object(value.value,
-                                                  lsdb_types.PrefixDatabase)
-            other_prefix_db = deserialize_thrift_object(other_val.value,
-                                                        lsdb_types.PrefixDatabase)
+            prefix_db = serializer.deserialize_thrift_object(
+                value.value, lsdb_types.PrefixDatabase)
+            other_prefix_db = serializer.deserialize_thrift_object(
+                other_val.value, lsdb_types.PrefixDatabase)
             other_prefix_set = {}
             utils.update_global_prefix_db(other_prefix_set, other_prefix_db)
             lines = utils.sprint_prefixes_db_delta(other_prefix_set, prefix_db)
 
         elif key.startswith(Consts.ADJ_DB_MARKER):
-            adj_db = deserialize_thrift_object(value.value,
-                                               lsdb_types.AdjacencyDatabase)
-            other_adj_db = deserialize_thrift_object(value.value,
-                                                     lsdb_types.AdjacencyDatabase)
+            adj_db = serializer.deserialize_thrift_object(
+                value.value, lsdb_types.AdjacencyDatabase)
+            other_adj_db = serializer.deserialize_thrift_object(
+                value.value, lsdb_types.AdjacencyDatabase)
             lines = utils.sprint_adj_db_delta(adj_db, other_adj_db)
 
         else:
@@ -315,12 +365,13 @@ class KvCompareCmd(KvStoreCmd):
         print(printing.render_vertical_table([[
             "key: {} only in {} kv store".format(key, node)]]))
 
-    def dump_nodes_kvs(self, nodes):
+    def dump_nodes_kvs(self, nodes, all_nodes_to_ips):
         ''' get the kvs of a set of nodes '''
 
         kv_dict = {}
         for node in nodes:
-            kv = utils.dump_node_kvs(node, self.kv_rep_port)
+            node_ip = all_nodes_to_ips.get(node, node)
+            kv = utils.dump_node_kvs(node_ip, self.kv_rep_port)
             if kv is not None:
                 kv_dict[node] = kv.keyVals
                 print('dumped kv from {}'.format(node))
@@ -361,9 +412,10 @@ class EraseKeyCmd(KvStoreCmd):
         # Get and modify the key
         val = publication.keyVals.get(key)
         val.value = None
-        val.ttl = 0           # set new ttl to 0
+        val.ttl = 1           # set new ttl to 0
         val.ttlVersion += 1   # bump up ttl version
 
+        print(publication.keyVals)
         response = self.client.set_key(publication.keyVals)
         if response != 'OK':
             print('Error: failed to set ttl to 0')
@@ -425,18 +477,47 @@ class TopologyCmd(KvStoreCmd):
         try:
             import matplotlib.pyplot as plt
             import networkx as nx
-        except Exception:
-            print("matplotlib and networkx needed for drawing. Skipping")
+        except ImportError:
+            print('Drawing topology requires `matplotlib` and `networkx` '
+                  'libraries. You can install them with following command and '
+                  'retry. \n'
+                  '  pip install matplotlib\n'
+                  '  pip install networkx')
             sys.exit(1)
 
+        rem_str = {
+            '.facebook.com': '',
+            '.tfbnw.net': '',
+        }
+        rem_str = dict((re.escape(k), v) for k, v in rem_str.items())
+        rem_pattern = re.compile("|".join(rem_str.keys()))
+
         publication = self.client.dump_all_with_prefix(Consts.ADJ_DB_MARKER)
-        nodes = self.get_node_list() if not node else [node]
+        nodes = self.get_node_to_ips().keys() if not node else [node]
         adjs_map = utils.adj_dbs_to_dict(publication, nodes, bidir,
                                          self.iter_publication)
         G = nx.Graph()
+        adj_metric_map = {}
+        node_overloaded = {}
+
+        for this_node_name, db in adjs_map.items():
+            node_overloaded[rem_pattern.sub(lambda m:
+                            rem_str[re.escape(m.group(0))],
+                            this_node_name)] = db['overloaded']
+            for adj in db['adjacencies']:
+                adj_metric_map[(this_node_name, adj['ifName'])] = adj['metric']
+
         for this_node_name, db in adjs_map.items():
             for adj in db['adjacencies']:
-                G.add_edge(this_node_name, adj['otherNodeName'], **adj)
+                adj['color'] = 'r' if adj['isOverloaded'] else 'b'
+                adj['adjOtherIfMetric'] = adj_metric_map[(adj['otherNodeName'],
+                                                            adj['otherIfName'])]
+                G.add_edge(rem_pattern.sub(lambda m:
+                                            rem_str[re.escape(m.group(0))],
+                                            this_node_name),
+                                            rem_pattern.sub(lambda m:
+                                                            rem_str[re.escape(m.group(0))],
+                                                            adj['otherNodeName']), **adj)
 
         # hack to get nice fabric
         # XXX: FB Specific
@@ -445,7 +526,14 @@ class TopologyCmd(KvStoreCmd):
         sswx = 0
         fswx = 0
         rswx = 0
+        blue_nodes = []
+        red_nodes = []
         for node in G.nodes():
+            if (node_overloaded[node]):
+                red_nodes.append(node)
+            else:
+                blue_nodes.append(node)
+
             if 'esw' in node:
                 pos[node] = [eswx, 3]
                 eswx += 10
@@ -462,16 +550,29 @@ class TopologyCmd(KvStoreCmd):
         maxswx = max(eswx, sswx, fswx, rswx)
         if maxswx > 0:
             # aesthetically pleasing multiplier (empirically determined)
-            plt.figure(figsize=(maxswx * 0.3, 8))
+            plt.figure(figsize=(maxswx * 0.5, 8))
         else:
             plt.figure(figsize=(len(G.nodes()) * 2, len(G.nodes()) * 2))
             pos = nx.spring_layout(G)
         plt.axis('off')
-        nx.draw_networkx(G, pos, ax=None, alpha=0.5, font_size=8)
+
+        edge_colors = []
+        for _, _, d in G.edges(data=True):
+            edge_colors.append(d['color'])
+
+        nx.draw_networkx_nodes(G, pos, ax=None, alpha=0.5,
+                                node_color='b', nodelist=blue_nodes)
+        nx.draw_networkx_nodes(G, pos, ax=None, alpha=0.5,
+                                node_color='r', nodelist=red_nodes)
+        nx.draw_networkx_labels(G, pos, ax=None, alpha=0.5, font_size=8)
+        nx.draw_networkx_edges(G, pos, ax=None, alpha=0.5,
+                                font_size=8, edge_color=edge_colors)
         if node:
-            edge_labels = dict([((u, v), str(d['ifName']) + ' metric: ' +
-                               str(d['metric']))
-                               for u, v, d in G.edges(data=True)])
+            edge_labels = dict([((u, v), '<' + str(d['otherIfName']) + ',  ' +
+                                str(d['metric']) +
+                                ' >     <' + str(d['ifName']) +
+                                    ', ' + str(d['adjOtherIfMetric']) + '>')
+                                for u, v, d in G.edges(data=True)])
             nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels,
                                          font_size=6)
 
@@ -480,19 +581,29 @@ class TopologyCmd(KvStoreCmd):
 
 
 class SnoopCmd(KvStoreCmd):
-    def run(self, delta, ttl, regex):
+    def run(self, delta, ttl, regex, duration):
 
         global_dbs = self.get_snapshot(delta)
         pattern = re.compile(regex)
 
         pub_client = kvstore_subscriber.KvStoreSubscriber(
-            zmq.Context(), "tcp://[{}]:{}".format(self.host, self.kv_pub_port))
+            zmq.Context(),
+            "tcp://[{}]:{}".format(self.host, self.kv_pub_port),
+            timeout=1000)
 
+        start_time = time.time()
         while True:
+            # End loop if it is time!
+            if duration > 0 and time.time() - start_time > duration:
+                break
+
             # we do not want to timeout. keep listening for a change
-            msg = pub_client.listen()
-            self.print_expired_keys(msg, regex, pattern, global_dbs)
-            self.print_delta(msg, regex, pattern, ttl, delta, global_dbs)
+            try:
+                msg = pub_client.listen()
+                self.print_expired_keys(msg, regex, pattern, global_dbs)
+                self.print_delta(msg, regex, pattern, ttl, delta, global_dbs)
+            except zmq.error.Again:
+                pass
 
     def print_expired_keys(self, msg, regex, pattern, global_dbs):
         rows = []
@@ -559,8 +670,8 @@ class SnoopCmd(KvStoreCmd):
     def print_prefix_delta(self, key, value, delta, global_prefix_db,
                            global_publication_db):
         _, reported_node_name = key.split(':', 1)
-        prefix_db = deserialize_thrift_object(value.value,
-                                              lsdb_types.PrefixDatabase)
+        prefix_db = serializer.deserialize_thrift_object(
+            value.value, lsdb_types.PrefixDatabase)
         if delta:
             lines = utils.sprint_prefixes_db_delta(global_prefix_db, prefix_db)
         else:
@@ -577,8 +688,8 @@ class SnoopCmd(KvStoreCmd):
     def print_adj_delta(self, key, value, delta,
                         global_adj_db, global_publication_db):
         _, reported_node_name = key.split(':', 1)
-        new_adj_db = deserialize_thrift_object(value.value,
-                                               lsdb_types.AdjacencyDatabase)
+        new_adj_db = serializer.deserialize_thrift_object(
+            value.value, lsdb_types.AdjacencyDatabase)
         if delta:
             old_adj_db = global_adj_db.get(new_adj_db.thisNodeName,
                                            None)
@@ -644,3 +755,59 @@ class SnoopCmd(KvStoreCmd):
                 global_dbs.publications[key] = (value.version,
                                                 value.originatorId)
         return global_dbs
+
+
+class AllocationsCmd(SetKeyCmd):
+    def run_list(self):
+        key = Consts.STATIC_PREFIX_ALLOC_PARAM_KEY
+        resp = self.client.get_keys([key])
+        if key not in resp.keyVals:
+            print('Static allocation is not set in KvStore')
+        else:
+            utils.print_allocations_table(resp.keyVals.get(key).value)
+
+    def run_set(self, node_name, prefix_str):
+        key = Consts.STATIC_PREFIX_ALLOC_PARAM_KEY
+        prefix = utils.ip_str_to_prefix(prefix_str)
+
+        # Retrieve previous allocation
+        resp = self.client.get_keys([key])
+        allocs = None
+        if key in resp.keyVals:
+            allocs = serializer.deserialize_thrift_object(
+                resp.keyVals.get(key).value, alloc_types.StaticAllocation)
+        else:
+            allocs = alloc_types.StaticAllocation(nodePrefixes={})
+
+        # Return if there is no change
+        if allocs.nodePrefixes.get(node_name) == prefix:
+            print('No changes needed. {}\'s prefix is already set to {}'
+                  .format(node_name, prefix_str))
+            return
+
+        # Update value in KvStore
+        allocs.nodePrefixes[node_name] = prefix
+        value = serializer.serialize_thrift_object(allocs)
+        self.run(key, value, 'breeze', None, Consts.CONST_TTL_INF)
+
+    def run_unset(self, node_name):
+        key = Consts.STATIC_PREFIX_ALLOC_PARAM_KEY
+
+        # Retrieve previous allocation
+        resp = self.client.get_keys([key])
+        allocs = None
+        if key in resp.keyVals:
+            allocs = serializer.deserialize_thrift_object(
+                resp.keyVals.get(key).value, alloc_types.StaticAllocation)
+        else:
+            allocs = alloc_types.StaticAllocation(nodePrefixes={node_name: ''})
+
+        # Return if there need no change
+        if node_name not in allocs.nodePrefixes:
+            print('No changes needed. {}\'s prefix is not set'
+                  .format(node_name))
+
+        # Update value in KvStore
+        del allocs.nodePrefixes[node_name]
+        value = serializer.serialize_thrift_object(allocs)
+        self.run(key, value, 'breeze', None, Consts.CONST_TTL_INF)

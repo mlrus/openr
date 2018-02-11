@@ -7,11 +7,13 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include <fbzmq/async/ZmqTimeout.h>
 #include <folly/futures/Future.h>
 #include <thrift/lib/cpp/async/TAsyncSocket.h>
 
@@ -54,6 +56,10 @@ class NetlinkFibHandler final : public thrift::LinuxFibServiceSvIf {
 
   int64_t aliveSince() override;
 
+  thrift::ServiceStatus getStatus() override;
+
+  void getCounters(std::map<std::string, int64_t>& counters) override;
+
   folly::Future<std::unique_ptr<std::vector<openr::thrift::UnicastRoute>>>
   future_getRouteTableByClient(int16_t clientId) override;
   folly::Future<std::unique_ptr<std::vector<openr::thrift::UnicastRoute>>>
@@ -72,6 +78,12 @@ class NetlinkFibHandler final : public thrift::LinuxFibServiceSvIf {
 
   // Time when service started, in number of seconds, since epoch
   const int64_t startTime_{0};
+
+  // Recent timepoint of aliveSince
+  std::chrono::steady_clock::time_point recentKeepAliveTs_;
+
+  // ZmqTimeout timer to check for openr aliveness
+  std::unique_ptr<fbzmq::ZmqTimeout> keepAliveCheckTimer_;
 };
 
 } // namespace openr

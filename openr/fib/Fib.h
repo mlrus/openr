@@ -53,7 +53,6 @@ class Fib final : public fbzmq::ZmqEventLoop {
       bool dryrun,
       std::chrono::seconds coldStartDuration,
       const DecisionPubUrl& decisionPubUrl,
-      const DecisionCmdUrl& decisionCmdUrl,
       const FibCmdUrl& fibRepUrl,
       const LinkMonitorGlobalPubUrl& linkMonPubUrl,
       const MonitorSubmitUrl& monitorSubmitUrl,
@@ -135,6 +134,12 @@ class Fib final : public fbzmq::ZmqEventLoop {
   std::unordered_map<thrift::IpPrefix, std::vector<thrift::Path>> routeDb_;
   std::deque<thrift::PerfEvents> perfDb_;
 
+  // store the latest routes that the fib agent has
+  std::set<thrift::UnicastRoute> agentRoutes_;
+
+  // Create timestamp of recently logged perf event
+  int64_t recentPerfEventCreateTs_{0};
+
   // Interface status map
   std::unordered_map<std::string /* ifName*/, bool /* isUp */>
       interfaceStatusDb_;
@@ -148,15 +153,17 @@ class Fib final : public fbzmq::ZmqEventLoop {
   // In dry run we do not make actual thrift call to manipulate routes
   bool dryrun_{true};
 
+  // amount of time to wait before send routes to agent either when this module
+  // starts or the agent we are talking with restarts
+  const std::chrono::seconds coldStartDuration_;
+
   // ZMQ sockets for communication with Decision and LinkMonitor modules
   fbzmq::Socket<ZMQ_SUB, fbzmq::ZMQ_CLIENT> decisionSub_;
-  fbzmq::Socket<ZMQ_REQ, fbzmq::ZMQ_CLIENT> decisionReq_;
   fbzmq::Socket<ZMQ_REP, fbzmq::ZMQ_SERVER> fibRep_;
   fbzmq::Socket<ZMQ_SUB, fbzmq::ZMQ_CLIENT> linkMonSub_;
 
   // ZMQ socket urls
   const std::string decisionPubUrl_;
-  const std::string decisionRepUrl_;
   const std::string fibRepUrl_;
   const std::string linkMonPubUrl_;
 

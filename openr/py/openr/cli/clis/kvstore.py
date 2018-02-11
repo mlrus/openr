@@ -11,40 +11,10 @@ from __future__ import unicode_literals
 from __future__ import division
 
 import click
-import zmq
-
-from thrift.protocol.TCompactProtocol import TCompactProtocolFactory
-from thrift.protocol.TJSONProtocol import TJSONProtocolFactory
 
 from openr.cli.commands import kvstore
 from openr.utils.consts import Consts
 from openr.cli.utils.utils import parse_nodes
-
-
-class KvStoreContext(object):
-    def __init__(self, verbose, zmq_ctx, host, timeout,
-                 kv_rep_port, kv_pub_port, lm_cmd_port,
-                 json, enable_color):
-        '''
-            :param zmq_ctx: the ZMQ context to create zmq sockets
-            :param host string: the openr router host
-            :param kv_rep_port int: the kv-store port
-            :param json bool: whether to use JSON proto or Compact for thrift
-            :param enable_color bool: whether to turn on coloring display
-        '''
-
-        self.verbose = verbose
-        self.host = host
-        self.timeout = timeout
-        self.zmq_ctx = zmq_ctx
-        self.enable_color = enable_color
-
-        self.kv_rep_port = kv_rep_port
-        self.kv_pub_port = kv_pub_port
-        self.lm_cmd_port = lm_cmd_port
-
-        self.proto_factory = (TJSONProtocolFactory if json
-                              else TCompactProtocolFactory)
 
 
 class KvStoreCli(object):
@@ -62,30 +32,21 @@ class KvStoreCli(object):
         self.kvstore.add_command(KvSignatureCli().kv_signature, name='kv-signature')
         self.kvstore.add_command(TopologyCli().topology)
         self.kvstore.add_command(SnoopCli().snoop)
+        self.kvstore.add_command(AllocationsCli().list, name='alloc-list')
+        self.kvstore.add_command(AllocationsCli().set, name='alloc-set')
+        self.kvstore.add_command(AllocationsCli().unset, name='alloc-unset')
 
     @click.group()
-    @click.option('--kv_rep_port', default=Consts.KVSTORE_REP_PORT,
-                  help='KV store rep port')
-    @click.option('--kv_pub_port', default=Consts.KVSTORE_PUB_PORT,
-                  help='KV store pub port')
-    @click.option('--json/--no-json', default=False,
-                  help='Use JSON serializer')
-    @click.option('--verbose/--no-verbose', default=False,
-                  help='Print verbose information')
+    @click.option('--kv_rep_port', default=None, type=int, help='KV store rep port')
+    @click.option('--kv_pub_port', default=None, type=int, help='KV store pub port')
     @click.pass_context
-    def kvstore(ctx, kv_rep_port, kv_pub_port, json, verbose):  # noqa: B902
+    def kvstore(ctx, kv_rep_port, kv_pub_port):  # noqa: B902
         ''' CLI tool to peek into KvStore module. '''
 
-        ctx.obj = KvStoreContext(
-            verbose, zmq.Context(),
-            ctx.obj.hostname,
-            ctx.obj.timeout,
-            ctx.obj.ports_config.get('kv_rep_port', None) or kv_rep_port,
-            ctx.obj.ports_config.get('kv_pub_port', None) or kv_pub_port,
-            ctx.obj.ports_config.get('lm_cmd_port', None) or
-            Consts.LINK_MONITOR_CMD_PORT,
-            json,
-            ctx.obj.enable_color)
+        if kv_pub_port:
+            ctx.obj.kv_pub_port = kv_pub_port
+        if kv_rep_port:
+            ctx.obj.kv_rep_port = kv_rep_port
 
 
 class PrefixesCli(object):
@@ -107,25 +68,29 @@ class PrefixesCli(object):
 class KeysCli(object):
 
     @click.command()
+    @click.option('--json/--no-json', default=False,
+                  help='Dump in JSON format')
     @click.option('--prefix', default='', help='string to filter keys')
     @click.option('--ttl/--no-ttl', default=False,
                   help='Show ttl value and version as well')
     @click.pass_obj
-    def keys(cli_opts, prefix, ttl):  # noqa: B902
+    def keys(cli_opts, json, prefix, ttl):  # noqa: B902
         ''' dump all available keys '''
 
-        kvstore.KeysCmd(cli_opts).run(prefix, ttl)
+        kvstore.KeysCmd(cli_opts).run(json, prefix, ttl)
 
 
 class KeyValsCli(object):
 
     @click.command()
-    @click.argument('keys', nargs=-1)
+    @click.argument('keys', nargs=-1, required=True)
+    @click.option('--json/--no-json', default=False,
+                  help='Dump in JSON format')
     @click.pass_obj
-    def keyvals(cli_opts, keys):  # noqa: B902
+    def keyvals(cli_opts, keys, json):  # noqa: B902
         ''' get values of input keys '''
 
-        kvstore.KeyValsCmd(cli_opts).run(keys)
+        kvstore.KeyValsCmd(cli_opts).run(keys, json)
 
 
 class NodesCli(object):
@@ -223,8 +188,9 @@ class SetKeyCli(object):
     def set_key(cli_opts, key, value, originator, version, ttl):  # noqa: B902
         ''' Set a custom key into KvStore '''
 
-        ttl_ms = ttl * 1000
-        kvstore.SetKeyCmd(cli_opts).run(key, value, originator, version, ttl_ms)
+        if ttl != Consts.CONST_TTL_INF:
+            ttl = ttl * 1000
+        kvstore.SetKeyCmd(cli_opts).run(key, value, originator, version, ttl)
 
 
 class KvSignatureCli(object):
@@ -271,10 +237,39 @@ class SnoopCli(object):
                   help='Print ttl updates')
     @click.option('--regex', default='',
                   help='Snoop on keys matching filter')
+    @click.option('--duration', default=0,
+                  help='How long to snoop for. Default is infinite')
     @click.pass_obj
-    def snoop(cli_opts, delta, ttl, regex):  # noqa: B902
+    def snoop(cli_opts, delta, ttl, regex, duration):  # noqa: B902
         ''' Snoop on KV-store updates in the network. We are primarily
             looking at the adj/prefix announcements.
         '''
 
-        kvstore.SnoopCmd(cli_opts).run(delta, ttl, regex)
+        kvstore.SnoopCmd(cli_opts).run(delta, ttl, regex, duration)
+
+
+class AllocationsCli(object):
+
+    @click.command()
+    @click.pass_obj
+    def list(cli_opts):  # noqa: B902
+        ''' View static allocations set in KvStore '''
+
+        kvstore.AllocationsCmd(cli_opts).run_list()
+
+    @click.command()
+    @click.argument('node', nargs=1, required=True)
+    @click.argument('prefix', nargs=1, required=True)
+    @click.pass_obj
+    def set(cli_opts, node, prefix):  # noqa: B902
+        ''' Set/Update prefix allocation for a certain node '''
+
+        kvstore.AllocationsCmd(cli_opts).run_set(node, prefix)
+
+    @click.command()
+    @click.argument('node', nargs=1, required=True)
+    @click.pass_obj
+    def unset(cli_opts, node):  # noqa: B902
+        ''' Unset prefix allocation for a certain node '''
+
+        kvstore.AllocationsCmd(cli_opts).run_unset(node)

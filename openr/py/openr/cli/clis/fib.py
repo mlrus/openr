@@ -11,43 +11,8 @@ from __future__ import unicode_literals
 from __future__ import division
 
 import click
-import zmq
-
-from thrift.protocol.TCompactProtocol import TCompactProtocolFactory
-from thrift.protocol.TJSONProtocol import TJSONProtocolFactory
 
 from openr.cli.commands import fib
-from openr.Platform import ttypes as platform_types
-from openr.utils.consts import Consts
-
-
-class FibContext(object):
-    def __init__(self, verbose, zmq_ctx, host, timeout, fib_rep_port,
-                 fib_agent_port, lm_cmd_port, decision_rep_port, client_id,
-                 json, enable_color):
-        '''
-            :param zmq_ctx: the ZMQ context to create zmq sockets
-            :param host string: the openr router host
-            :param fib_rep_port int: the fib module port
-            :param json bool: whether to use JSON proto or Compact for thrift
-            :param enable_color bool: whether to turn on coloring display
-        '''
-
-        self.verbose = verbose
-        self.host = host
-        self.timeout = timeout
-        self.zmq_ctx = zmq_ctx
-        self.enable_color = enable_color
-
-        self.fib_rep_port = fib_rep_port
-        self.fib_agent_port = fib_agent_port
-        self.lm_cmd_port = lm_cmd_port
-        self.decision_rep_port = decision_rep_port
-
-        self.client_id = client_id
-
-        self.proto_factory = (TJSONProtocolFactory if json
-                              else TCompactProtocolFactory)
 
 
 class FibCli(object):
@@ -65,44 +30,35 @@ class FibCli(object):
                                 name='validate-linux')
 
     @click.group()
-    @click.option('--fib_rep_port', default=Consts.FIB_REP_PORT, help='Fib rep port')
-    @click.option('--fib_agent_port', default=Consts.FIB_AGENT_PORT,
+    @click.option('--fib_rep_port', default=None, type=int, help='Fib rep port')
+    @click.option('--fib_agent_port', default=None, type=int,
                   help='Fib thrift server port')
-    @click.option('--client-id', default=platform_types.FibClient.OPENR,
+    @click.option('--client-id', default=None, type=int,
                   help='FIB Client ID')
-    @click.option('--json/--no-json', default=False,
-                  help='Use JSON serializer')
-    @click.option('--verbose/--no-verbose', default=False,
-                  help='Print verbose information')
     @click.pass_context
-    def fib(ctx, fib_rep_port, fib_agent_port, client_id, json, verbose):  # noqa: B902
+    def fib(ctx, fib_rep_port, fib_agent_port, client_id):  # noqa: B902
         ''' CLI tool to peek into Fib module. '''
 
-        ctx.obj = FibContext(
-            verbose, zmq.Context(),
-            ctx.obj.hostname,
-            ctx.obj.timeout,
-            ctx.obj.ports_config.get('fib_rep_port', None) or fib_rep_port,
-            ctx.obj.ports_config.get('fib_agent_port', None) or fib_agent_port,
-            ctx.obj.ports_config.get('lm_cmd_port', None) or
-            Consts.LINK_MONITOR_CMD_PORT,
-            ctx.obj.ports_config.get('decision_rep_port', None) or
-            Consts.DECISION_REP_PORT,
-            client_id,
-            json,
-            ctx.obj.enable_color)
+        if fib_rep_port:
+            ctx.obj.fib_rep_port = fib_rep_port
+        if fib_agent_port:
+            ctx.obj.fib_agent_port = fib_agent_port
+        if client_id:
+            ctx.obj.client_id = client_id
 
 
 class FibRoutesCli(object):
 
     @click.command()
+    @click.option('--prefixes', '-p', default='', multiple=True,
+                  help='Get route for specific IPs or Prefixes.')
     @click.option('--json/--no-json', default=False,
                   help='Dump in JSON format')
     @click.pass_obj
-    def routes(cli_opts, json):  # noqa: B902
+    def routes(cli_opts, prefixes, json):  # noqa: B902
         ''' Request routing table of the current host '''
 
-        fib.FibRoutesCmd(cli_opts).run(json)
+        fib.FibRoutesCmd(cli_opts).run(prefixes, json)
 
 
 class FibCountersCli(object):
@@ -118,11 +74,13 @@ class FibCountersCli(object):
 class FibListRoutesCli(object):
 
     @click.command()
+    @click.option('--prefixes', '-p', default='', multiple=True,
+                  help='Get route for specific IPs or Prefixes.')
     @click.pass_obj
-    def list_routes(cli_opts):  # noqa: B902
+    def list_routes(cli_opts, prefixes):  # noqa: B902
         ''' Get and print all the routes on fib agent '''
 
-        fib.FibListRoutesCmd(cli_opts).run()
+        fib.FibListRoutesCmd(cli_opts).run(prefixes)
 
 
 class FibAddRoutesCli(object):
@@ -173,11 +131,13 @@ class FibValidateRoutesCli(object):
 class FibListRoutesLinuxCli(object):
 
     @click.command()
+    @click.option('--prefixes', '-p', default='', multiple=True,
+                  help='Get route for specific IPs or Prefixes.')
     @click.pass_obj
-    def list_routes_linux(cli_opts):  # noqa: B902
+    def list_routes_linux(cli_opts, prefixes):  # noqa: B902
         ''' List routes from linux kernel routing table '''
 
-        fib.FibListRoutesLinuxCmd(cli_opts).run()
+        fib.FibListRoutesLinuxCmd(cli_opts).run(prefixes)
 
 
 class FibValidateRoutesLinuxCli(object):

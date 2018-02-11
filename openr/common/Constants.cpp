@@ -32,6 +32,10 @@ const std::chrono::milliseconds Constants::kLinkThrottleTimeout{1000};
 const std::chrono::seconds Constants::kStoreSyncInterval{60};
 
 const std::chrono::milliseconds Constants::kPrefixAllocatorSyncInterval{1000};
+const std::string Constants::kSeedPrefixAllocLenSeparator{","};
+const std::string Constants::kSeedPrefixAllocParamKey{"e2e-network-prefix"};
+const std::string Constants::kStaticPrefixAllocParamKey{
+  "e2e-network-allocations"};
 
 const std::chrono::seconds Constants::kMonitorSubmitInterval{5};
 
@@ -51,7 +55,7 @@ const std::string Constants::kPlatformHost{"::1"};
 
 // Timeout values for thrift TCP connection with switch agent
 const std::chrono::milliseconds Constants::kPlatformConnTimeout{100};
-const std::chrono::milliseconds Constants::kPlatformProcTimeout{1000};
+const std::chrono::milliseconds Constants::kPlatformProcTimeout{10000};
 
 // Required percentage change in measured RTT for announcing new RTT
 const double Constants::kRttChangeThreashold{10.0};
@@ -98,10 +102,11 @@ const std::string Constants::kAdjDbMarker{"adj:"};
 const std::string Constants::kInterfaceDbMarker{"intf:"};
 const std::string Constants::kPrefixDbMarker{"prefix:"};
 const std::string Constants::kPrefixAllocMarker{"allocprefix:"};
+const std::string Constants::kNodeLabelRangePrefix{"nodeLabel:"};
 
 // ExponentialBackoff constants
-const std::chrono::milliseconds Constants::kInitialBackoff{100};
-const std::chrono::milliseconds Constants::kMaxBackoff{4000};
+const std::chrono::milliseconds Constants::kInitialBackoff{64};
+const std::chrono::milliseconds Constants::kMaxBackoff{8192};
 
 // Default keepAlive values
 // We intend to garbage collect flows after 1 min of inactivity
@@ -129,5 +134,6 @@ const int64_t Constants::kDefaultAdjWeight{1};
 
 // buffer size to keep latest perf log
 const uint16_t Constants::kPerfBufferSize{10};
+const std::chrono::seconds Constants::kConvergenceMaxDuration{3s};
 
 } // namespace openr

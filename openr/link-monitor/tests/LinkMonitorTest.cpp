@@ -55,16 +55,21 @@ namespace {
 // we need the right key length for some checks in zmqSocket
 const std::string pubKey = fbzmq::util::genKeyPair().publicKey;
 
+const auto regexOpts =
+  std::regex_constants::extended |
+  std::regex_constants::icase |
+  std::regex_constants::optimize;
+
 const auto peerSpec_2_1 = thrift::PeerSpec(
     FRAGILE,
     "tcp://[fe80::2%iface_2_1]:10001",
-    "tcp://[fe80::2%iface_2_1]:20002",
+    "tcp://[fe80::2%iface_2_1]:10002",
     pubKey);
 
 const auto peerSpec_2_2 = thrift::PeerSpec(
     FRAGILE,
     "tcp://[fe80::2%iface_2_2]:10001",
-    "tcp://[fe80::2%iface_2_2]:20002",
+    "tcp://[fe80::2%iface_2_2]:10002",
     pubKey);
 
 const auto nb2 = thrift::SparkNeighbor(
@@ -231,6 +236,7 @@ class LinkMonitorTestFixture : public ::testing::Test {
         folly::none,
         PrefixDbMarker{Constants::kPrefixDbMarker},
         false,
+        MonitorSubmitUrl{"inproc://monitor_submit"},
         context);
     prefixManagerThread = std::make_unique<std::thread>([this] {
       LOG(INFO) << "prefix manager starting";
@@ -253,21 +259,19 @@ class LinkMonitorTestFixture : public ::testing::Test {
         port, /* thrift service port */
         KvStoreLocalCmdUrl{kvStoreWrapper->localCmdUrl},
         KvStoreLocalPubUrl{kvStoreWrapper->localPubUrl},
-        std::vector<std::regex>{std::regex{kTestVethNamePrefix + ".*",
-                                           std::regex_constants::extended |
-                                               std::regex_constants::icase |
-                                               std::regex_constants::optimize},
-                                std::regex{"iface.*",
-                                           std::regex_constants::extended |
-                                               std::regex_constants::icase |
-                                               std::regex_constants::optimize}},
+        std::vector<std::regex>{
+          std::regex{kTestVethNamePrefix + ".*", regexOpts},
+          std::regex{"iface.*", regexOpts}},
         std::vector<std::regex>{},
-        std::set<std::string>{"loopback"}, // redistribute interface name
+        std::vector<std::regex>{
+          std::regex{"loopback", regexOpts}}, // redistribute interface name
         std::vector<thrift::IpPrefix>{staticPrefix1, staticPrefix2},
         false /* useRttMetric */,
         false /* enable full mesh reduction */,
         false /* enable perf measurement */,
         true /* enable v4 */,
+        true /* advertise interface db */,
+        true /* enable segment routing */,
         AdjacencyDbMarker{"adj:"},
         InterfaceDbMarker{"intf:"},
         SparkCmdUrl{"inproc://spark-req"},
@@ -435,7 +439,6 @@ class LinkMonitorTestFixture : public ::testing::Test {
   checkNextAdjPub(std::string const& key) {
     CHECK(!expectedAdjDbs.empty());
 
-    VLOG(1) << "***** Expecting Adjacency DB *****";
     printAdjDb(expectedAdjDbs.front());
 
     while (true) {
@@ -453,7 +456,6 @@ class LinkMonitorTestFixture : public ::testing::Test {
 
       auto adjDb = fbzmq::util::readThriftObjStr<thrift::AdjacencyDatabase>(
           value->value.value(), serializer);
-      LOG(INFO) << "******* Received *******";
       printAdjDb(adjDb);
 
       // we can not know what the nodeLabel will be
@@ -472,10 +474,20 @@ class LinkMonitorTestFixture : public ::testing::Test {
     }
   }
 
+  // kvstore shall reveive cmd to add/del peers
+  void checkPeerDump(std::string const& nodeName, thrift::PeerSpec peerSpec) {
+    auto const peers = kvStoreWrapper->getPeers();
+    EXPECT_EQ(peers.count(nodeName), 1);
+    if (!peers.count(nodeName)) {
+      return;
+    }
+    EXPECT_EQ(peers.at(nodeName).pubUrl, peerSpec.pubUrl);
+    EXPECT_EQ(peers.at(nodeName).cmdUrl, peerSpec.cmdUrl);
+  }
+
   void
   checkNextIntfPub(
       std::string const& key, thrift::InterfaceDatabase const& expectedIntfDb) {
-    VLOG(1) << "***** Expecting Interface DB *****";
     printIntfDb(expectedIntfDb);
 
     while (true) {
@@ -900,17 +912,17 @@ TEST_F(LinkMonitorTestFixture, BasicOperation) {
         port, // platform pub port
         KvStoreLocalCmdUrl{kvStoreWrapper->localCmdUrl},
         KvStoreLocalPubUrl{kvStoreWrapper->localPubUrl},
-        std::vector<std::regex>{std::regex{kTestVethNamePrefix + ".*",
-                                           std::regex_constants::extended |
-                                               std::regex_constants::icase |
-                                               std::regex_constants::optimize}},
+        std::vector<std::regex>{
+          std::regex{kTestVethNamePrefix + ".*", regexOpts}},
         std::vector<std::regex>{},
-        std::set<std::string>(), // redistribute interface names
-        std::vector<thrift::IpPrefix>(), // static prefixes
+        std::vector<std::regex>{}, // redistribute interface names
+        std::vector<thrift::IpPrefix>{}, // static prefixes
         false /* useRttMetric */,
         false /* enable full mesh reduction */,
         false /* enable perf measurement */,
         false /* enable v4 */,
+        true /* advertise interface db */,
+        true /* enable segment routing */,
         AdjacencyDbMarker{"adj:"},
         InterfaceDbMarker{"intf:"},
         SparkCmdUrl{"inproc://spark-req2"},
@@ -1055,6 +1067,10 @@ TEST_F(LinkMonitorTestFixture, ParallelAdj) {
   }
 
   checkNextAdjPub("adj:node-1");
+  // wait for this peer change to propogate
+  /* sleep override */
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  checkPeerDump(adj_2_1.otherNodeName, peerSpec_2_1);
 
   // neighbor up on another interface
   {
@@ -1068,6 +1084,10 @@ TEST_F(LinkMonitorTestFixture, ParallelAdj) {
   }
 
   checkNextAdjPub("adj:node-1");
+  // wait for this peer change to propogate
+  /* sleep override */
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  checkPeerDump(adj_2_1.otherNodeName, peerSpec_2_1);
 
   // neighbor down
   {
@@ -1081,6 +1101,10 @@ TEST_F(LinkMonitorTestFixture, ParallelAdj) {
   }
 
   checkNextAdjPub("adj:node-1");
+  // wait for this peer change to propogate
+  /* sleep override */
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  checkPeerDump(adj_2_2.otherNodeName, peerSpec_2_2);
 }
 
 TEST_F(LinkMonitorTestFixture, DampenLinkFlaps) {
@@ -1101,23 +1125,18 @@ TEST_F(LinkMonitorTestFixture, DampenLinkFlaps) {
       KvStoreLocalCmdUrl{kvStoreWrapper->localCmdUrl},
       KvStoreLocalPubUrl{kvStoreWrapper->localPubUrl},
       std::vector<std::regex>{
-        std::regex{
-          kTestVethNamePrefix + ".*",
-          std::regex_constants::extended |
-          std::regex_constants::icase |
-          std::regex_constants::optimize},
-        std::regex{
-          "iface.*",
-          std::regex_constants::extended |
-          std::regex_constants::icase |
-          std::regex_constants::optimize}},
+        std::regex{kTestVethNamePrefix + ".*", regexOpts},
+        std::regex{"iface.*", regexOpts}},
       std::vector<std::regex>{},
-      std::set<std::string>{"loopback"}, // redistribute interface name
+      std::vector<std::regex>{
+        std::regex{"loopback", regexOpts}}, // redistribute interface name
       std::vector<thrift::IpPrefix>{staticPrefix1, staticPrefix2},
       false /* useRttMetric */,
       false /* enable full mesh reduction */,
       false /* enable perf measurement */,
       true /* enable v4 */,
+      true /* advertise interface db */,
+      true /* enable segment routing */,
       AdjacencyDbMarker{"adj:"},
       InterfaceDbMarker{"intf:"},
       SparkCmdUrl{"inproc://spark-req"},
@@ -1126,8 +1145,8 @@ TEST_F(LinkMonitorTestFixture, DampenLinkFlaps) {
       PersistentStoreUrl{kConfigStoreUrl},
       PrefixManagerLocalCmdUrl{"inproc://prefix-manager-local-url"},
       PlatformPublisherUrl{"inproc://platform-pub-url"},
-      LinkMonitorGlobalPubUrl{"inproc://link-monitor-pub-url"},
-      LinkMonitorGlobalCmdUrl{"inproc://link-monitor-cmd-url"},
+      LinkMonitorGlobalPubUrl{"inproc://link-monitor-pub-url2"},
+      LinkMonitorGlobalCmdUrl{"inproc://link-monitor-cmd-url2"},
       std::chrono::seconds(1),
       // link flap backoffs, set high backoffs for this test
       std::chrono::milliseconds(1500),
@@ -1481,17 +1500,17 @@ TEST_F(LinkMonitorTestFixture, NodeLabelAlloc) {
         0, // platform pub port
         KvStoreLocalCmdUrl{kvStoreWrapper->localCmdUrl},
         KvStoreLocalPubUrl{kvStoreWrapper->localPubUrl},
-        std::vector<std::regex>{std::regex{kTestVethNamePrefix + ".*",
-                                           std::regex_constants::extended |
-                                               std::regex_constants::icase |
-                                               std::regex_constants::optimize}},
+        std::vector<std::regex>{
+          std::regex{kTestVethNamePrefix + ".*", regexOpts}},
         std::vector<std::regex>{},
-        std::set<std::string>(),
+        std::vector<std::regex>{},
         std::vector<thrift::IpPrefix>(),
         false /* useRttMetric */,
         false /* enable full mesh reduction */,
         false /* enable perf measurement */,
         false /* enable v4 */,
+        true /* advertise interface db */,
+        true /* enable segment routing */,
         AdjacencyDbMarker{"adj:"},
         InterfaceDbMarker{"intf:"},
         SparkCmdUrl{"inproc://spark-req"},
@@ -1582,8 +1601,6 @@ TEST_F(LinkMonitorTestFixture, StaticLoopbackPrefixAdvertisement) {
   mockNlHandler->sendLinkEvent("loopback", 101, true);
   mockNlHandler->sendAddrEvent("loopback", "fe80::1/128", true);
   mockNlHandler->sendAddrEvent("loopback", "fe80::2/64", true);
-  mockNlHandler->sendAddrEvent("loopback", "2803:6080:4958::/64", true);
-  mockNlHandler->sendAddrEvent("loopback", "10.192.240.0/24", true);
 
   // push some valid loopback addresses
   mockNlHandler->sendAddrEvent("loopback", "10.127.240.1/32", true);

@@ -38,7 +38,7 @@ const std::chrono::seconds kDbSyncInterval(1);
 const std::chrono::seconds kMonitorSubmitInterval(3600);
 
 // TTL in ms
-const int64_t kTtlMs = 100;
+const int64_t kTtlMs = 1000;
 
 // Timeout for recieving publication from KvStore. This spans the maximum
 // duration it can take to propogate an update through KvStores
@@ -203,6 +203,9 @@ class KvStoreTestTtlFixture : public KvStoreTestFixture {
         for (const auto kv : dump) {
           EXPECT_TRUE(kv.second.hash.value() != 0);
           EXPECT_TRUE(hashDump.count(kv.first) != 0);
+          if (!hashDump.count(kv.first)) {
+            continue;
+          }
           EXPECT_EQ(kv.second.hash.value(), hashDump.at(kv.first).hash.value());
         }
 
@@ -430,6 +433,16 @@ TEST(KvStore, mergeKeyValuesTest) {
     auto deltaPub = KvStore::mergeKeyValues(myStore, newStore);
     EXPECT_EQ(myStore, oldStore);
     EXPECT_EQ(deltaPub.keyVals.size(), 0);
+  }
+
+  // bogus ttl value (see it should get ignored)
+  {
+    std::unordered_map<std::string, thrift::Value> emptyStore;
+    newKvIt->second = thriftValue;
+    newKvIt->second.ttl = -100;
+    auto deltaPub = KvStore::mergeKeyValues(emptyStore, newStore);
+    EXPECT_EQ(deltaPub.keyVals.size(), 0);
+    EXPECT_EQ(emptyStore.size(), 0);
   }
 }
 
@@ -971,6 +984,103 @@ TEST_F(KvStoreTestFixture, DumpPrefix) {
 
   // Verify myStore database. we only want keys with "0" prefix
   EXPECT_EQ(expectedKeyVals, myStore->dumpAll("0"));
+}
+
+/**
+ * Start single testable store, and set key values.
+ * Try to request for KEY_DUMP with a few keyValHashes.
+ * We only supposed to see a dump of those keyVals on which either key is not
+ * present in provided keyValHashes or hash differs.
+ */
+TEST_F(KvStoreTestFixture, DumpDifference) {
+  LOG(INFO) << "Starting store under test";
+
+  // set up the store that we'll be testing
+  const std::unordered_map<std::string, thrift::PeerSpec> emptyPeers;
+  auto myNodeId = "test-node";
+  auto myStore = createKvStore(myNodeId, emptyPeers);
+  myStore->run();
+
+  std::unordered_map<std::string, thrift::Value> expectedKeyVals;
+  std::unordered_map<std::string, thrift::Value> peerKeyVals;
+  std::unordered_map<std::string, thrift::Value> diffKeyVals;
+  const std::unordered_map<std::string, thrift::Value> emptyKeyVals;
+  for (int i = 0; i < 3; ++i) {
+    const auto key = folly::sformat("test-key-{}", i);
+    thrift::Value thriftVal(
+        apache::thrift::FRAGILE,
+        1 /* version */,
+        "gotham_city" /* originatorId */,
+        folly::sformat("test-value-{}", myStore->nodeId),
+        Constants::kTtlInfinity /* ttl */,
+        0 /* ttl version */,
+        0 /* hash */);
+
+    // Submit the key-value to myStore
+    myStore->setKey(key, thriftVal);
+
+    // Update hash
+    thriftVal.hash = generateHash(
+        thriftVal.version, thriftVal.originatorId, thriftVal.value);
+
+    // Store keyVals
+    expectedKeyVals[key] = thriftVal;
+    if (i == 0) {
+      diffKeyVals[key] = thriftVal;
+    } else {
+      peerKeyVals[key] = thriftVal;
+    }
+  }
+
+  // 0. Expect all keys
+  EXPECT_EQ(expectedKeyVals, myStore->dumpAll());
+
+  // 1. Query missing keys (test-key-0 will be returned)
+  EXPECT_EQ(diffKeyVals, myStore->syncKeyVals(peerKeyVals));
+
+  // Add missing key, test-key-0, into peerKeyVals
+  const auto key = "test-key-0";
+  const auto strVal = folly::sformat("test-value-{}", myStore->nodeId);
+  const thrift::Value thriftVal(
+      apache::thrift::FRAGILE,
+      1 /* version */,
+      "gotham_city" /* originatorId */,
+      strVal /* value */,
+      Constants::kTtlInfinity /* ttl */,
+      0 /* ttl version */,
+      generateHash(1, "gotham_city", strVal));
+  peerKeyVals[key] = thriftVal;
+
+  // 2. Query with same snapshot. Expect no changes
+  {
+    EXPECT_EQ(emptyKeyVals, myStore->syncKeyVals(peerKeyVals));
+  }
+
+  // 3. Query with different value (change value/hash of test-key-0)
+  {
+    auto newThriftVal = thriftVal;
+    newThriftVal.value = "why-so-serious";
+    newThriftVal.hash = generateHash(
+        newThriftVal.version, newThriftVal.originatorId, newThriftVal.value);
+    peerKeyVals[key] = newThriftVal;
+    EXPECT_EQ(diffKeyVals, myStore->syncKeyVals(peerKeyVals));
+  }
+
+  // 3. Query with different originatorID (change originatorID of test-key-0)
+  {
+    auto newThriftVal = thriftVal;
+    newThriftVal.originatorId = "new_york_city";
+    peerKeyVals[key] = newThriftVal;
+    EXPECT_EQ(diffKeyVals, myStore->syncKeyVals(peerKeyVals));
+  }
+
+  // 4. Query with different ttlVersion (change ttlVersion of test-key-1)
+  {
+    auto newThriftVal = thriftVal;
+    newThriftVal.ttlVersion = 0xb007;
+    peerKeyVals[key] = newThriftVal;
+    EXPECT_EQ(diffKeyVals, myStore->syncKeyVals(peerKeyVals));
+  }
 }
 
 int

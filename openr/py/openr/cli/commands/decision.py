@@ -10,7 +10,7 @@ from __future__ import print_function
 from __future__ import unicode_literals
 from __future__ import division
 
-from openr.clients import decision_client
+from openr.clients import decision_client, kvstore_client
 from openr.cli.utils import utils
 from openr.utils import printing
 from openr.utils.serializer import deserialize_thrift_object
@@ -36,6 +36,11 @@ class DecisionCmd(object):
         self.client = decision_client.DecisionClient(
             cli_opts.zmq_ctx,
             "tcp://[{}]:{}".format(cli_opts.host, cli_opts.decision_rep_port),
+            cli_opts.timeout,
+            cli_opts.proto_factory)
+        self.kvstore_client = kvstore_client.KvStoreClient(
+            cli_opts.zmq_ctx,
+            "tcp://[{}]:{}".format(cli_opts.host, cli_opts.kv_rep_port),
             cli_opts.timeout,
             cli_opts.proto_factory)
 
@@ -64,7 +69,7 @@ class DecisionPrefixesCmd(DecisionCmd):
 
 
 class DecisionRoutesCmd(DecisionCmd):
-    def run(self, nodes, json):
+    def run(self, nodes, prefixes, json):
         if 'all' in nodes:
             nodes = self._get_all_nodes()
         if json:
@@ -72,11 +77,11 @@ class DecisionRoutesCmd(DecisionCmd):
             for node in nodes:
                 route_db = self.client.get_route_db(node)
                 route_db_dict[node] = utils.route_db_to_dict(route_db)
-            utils.print_routes_json(route_db_dict)
+            utils.print_routes_json(route_db_dict, prefixes)
         else:
             for node in nodes:
                 route_db = self.client.get_route_db(node)
-                utils.print_routes_table(route_db)
+                utils.print_routes_table(route_db, prefixes)
 
     def _get_all_nodes(self):
         ''' return all the nodes' name in the network '''
@@ -106,23 +111,53 @@ class PathCmd(DecisionCmd):
             host_id = utils.get_connected_node_name(self.host, self.lm_cmd_port)
             src = src or host_id
             dst = dst or host_id
-        paths = self.get_paths(self.client, src, dst, max_hop)
+
+        # Get prefix_dbs from KvStore
+        self.prefix_dbs = {}
+        pub = self.kvstore_client.dump_all_with_prefix(Consts.PREFIX_DB_MARKER)
+        for v in pub.keyVals.values():
+            prefix_db = deserialize_thrift_object(
+                v.value, lsdb_types.PrefixDatabase)
+            self.prefix_dbs[prefix_db.thisNodeName] = prefix_db
+
+        paths = self.get_paths(src, dst, max_hop)
         self.print_paths(paths)
 
-    def get_loopback_addr(self, prefix_dbs, node):
+    def get_loopback_addr(self, node):
         ''' get node's loopback addr'''
 
         def _parse(loopback_set, prefix_db):
             for prefix_entry in prefix_db.prefixEntries:
-                if (prefix_entry.type == lsdb_types.PrefixType.LOOPBACK and
-                        len(prefix_entry.prefix.prefixAddress.addr) == 16):
-                    loopback_set.add(utils.sprint_prefix(prefix_entry.prefix))
+                # Only consider v6 address
+                if len(prefix_entry.prefix.prefixAddress.addr) != 16:
+                    continue
+
+                # Parse PrefixAllocator address
+                if prefix_entry.type == lsdb_types.PrefixType.PREFIX_ALLOCATOR:
+                    prefix = utils.sprint_prefix(prefix_entry.prefix)
+                    if prefix_entry.prefix.prefixLength == 128:
+                        prefix = prefix.split('/')[0]
+                    else:
+                        # TODO: we should ideally get address with last bit
+                        # set to 1. `python3.6 ipaddress` libraries does this
+                        # in one line. Alas no easy options with ipaddr
+                        # NOTE: In our current usecase we are just assuming
+                        # that allocated prefix has last 16 bits set to 0
+                        prefix = prefix.split('/')[0] + '1'
+                    loopback_set.add(prefix)
+                    continue
+
+                # Parse LOOPBACK address
+                if prefix_entry.type == lsdb_types.PrefixType.LOOPBACK:
+                    prefix = utils.sprint_prefix(prefix_entry.prefix)
+                    loopback_set.add(prefix.split('/')[0])
+                    continue
 
         loopback_set = set()
-        self.iter_dbs(loopback_set, prefix_dbs, node, _parse)
-        return loopback_set.pop() if len(loopback_set) > 0 else ''
+        self.iter_dbs(loopback_set, self.prefix_dbs, node, _parse)
+        return loopback_set.pop() if len(loopback_set) > 0 else None
 
-    def get_node_prefixes(self, prefix_dbs, node):
+    def get_node_prefixes(self, node):
 
         def _parse(prefix_set, prefix_db):
             for prefix_entry in prefix_db.prefixEntries:
@@ -130,43 +165,50 @@ class PathCmd(DecisionCmd):
                     prefix_set.add(utils.sprint_prefix(prefix_entry.prefix))
 
         prefix_set = set()
-        self.iter_dbs(prefix_set, prefix_dbs, node, _parse)
+        self.iter_dbs(prefix_set, self.prefix_dbs, node, _parse)
         return prefix_set
 
     def get_if2node_map(self, adj_dbs):
         ''' create a map from interface to node '''
 
         def _parse(if2node, adj_db):
+            nexthop_dict = if2node[adj_db.thisNodeName]
             for adj in adj_db.adjacencies:
-                if2node[adj_db.thisNodeName][adj.ifName] = adj.otherNodeName
+                nh6_addr = utils.sprint_addr(adj.nextHopV6.addr)
+                nh4_addr = utils.sprint_addr(adj.nextHopV4.addr)
+                nexthop_dict[(adj.ifName, nh6_addr)] = adj.otherNodeName
+                nexthop_dict[(adj.ifName, nh4_addr)] = adj.otherNodeName
 
         if2node = defaultdict(dict)
         self.iter_dbs(if2node, adj_dbs, ["all"], _parse)
         return if2node
 
-    def get_lpm_routes(self, route_db, dst_addr):
+    def get_lpm_route(self, route_db, dst_addr):
         ''' find the routes to the longest prefix matches of dst. '''
 
-        max_prefix_len = 0
-        lpm_routes = []
+        max_prefix_len = -1
+        lpm_route = None
         for route in route_db.routes:
             if IPNetwork(utils.sprint_prefix(route.prefix)).Contains(
                     IPAddress(dst_addr)):
                 next_hop_prefix_len = route.prefix.prefixLength
                 if next_hop_prefix_len == max_prefix_len:
-                    lpm_routes.append(route)
+                    raise Exception('Duplicate prefix found in routing table {}'
+                                    .format(utils.sprint_prefix(route.prefix)))
                 elif next_hop_prefix_len > max_prefix_len:
-                    lpm_routes = [route]
+                    lpm_route = route
                     max_prefix_len = next_hop_prefix_len
 
-        return lpm_routes
+        return lpm_route
 
-    def get_lpm_len_from_node(self, node, dst_addr, prefix_dbs):
-        ''' return the longest prefix match of dst_addr in node's advertising
-        prefix pool '''
+    def get_lpm_len_from_node(self, node, dst_addr):
+        '''
+        return the longest prefix match of dst_addr in node's
+        advertising prefix pool
+        '''
 
         cur_lpm_len = 0
-        for cur_prefix in self.get_node_prefixes(prefix_dbs, node):
+        for cur_prefix in self.get_node_prefixes(node):
             if IPNetwork(cur_prefix).Contains(IPAddress(dst_addr)):
                 cur_len = int(cur_prefix.split('/')[1])
                 cur_lpm_len = max(cur_lpm_len, cur_len)
@@ -181,9 +223,8 @@ class PathCmd(DecisionCmd):
         next_hop_nodes = []
         is_initialized = fib_routes[route_db.thisNodeName]
 
-        for lpm_route in self.get_lpm_routes(route_db, dst_addr):
-            if lpm_route.prefix.prefixLength <= cur_lpm_len:
-                continue
+        lpm_route = self.get_lpm_route(route_db, dst_addr)
+        if lpm_route and lpm_route.prefix.prefixLength >= cur_lpm_len:
             if in_fib and not is_initialized:
                 fib_routes[route_db.thisNodeName].extend(
                     self.get_fib_path(
@@ -191,49 +232,52 @@ class PathCmd(DecisionCmd):
                         utils.sprint_prefix(lpm_route.prefix),
                         self.fib_agent_port,
                         self.timeout))
-
-            for path in lpm_route.paths:
+            min_cost = min([p.metric for p in lpm_route.paths])
+            for path in [p for p in lpm_route.paths if p.metric == min_cost]:
                 if len(path.nextHop.addr) == 16:
-                    next_hop_node_name = if2node[route_db.thisNodeName][path.ifName]
-                    next_hop_nodes.append([next_hop_node_name, path.ifName, path.metric,
-                                           utils.sprint_addr(path.nextHop.addr)])
-
+                    nh_addr = utils.sprint_addr(path.nextHop.addr)
+                    next_hop_node_name = \
+                        if2node[route_db.thisNodeName][(path.ifName, nh_addr)]
+                    next_hop_nodes.append([
+                        next_hop_node_name,
+                        path.ifName,
+                        path.metric,
+                        nh_addr,
+                    ])
         return next_hop_nodes
 
     def get_fib_path(self, src, dst_prefix, fib_agent_port, timeout):
+        src_addr = self.get_loopback_addr(src)
+        if src_addr is None:
+            return []
+
         try:
-            client = utils.get_fib_agent_client(src, fib_agent_port, timeout)
+            client = utils.get_fib_agent_client(
+                src_addr, fib_agent_port, timeout)
             routes = client.getRouteTableByClient(client.client_id)
         except Exception:
-            try:
-                client = utils.get_fib_agent_client(src, fib_agent_port,
-                                                    timeout)
-                routes = client.getRouteTableByClient(client.client_id)
-            except Exception:
-                return []
-
+            return []
         for route in routes:
             if utils.sprint_prefix(route.dest) == dst_prefix:
                 return route.nexthops
         return []
 
-    def get_paths(self, client, src, dst, max_hop):
+    def get_paths(self, src, dst, max_hop):
         ''' calc paths from src to dst using backtracking. can add memoization to
         convert to dynamic programming for better scalability when network is large.
         '''
 
-        prefix_dbs = client.get_prefix_dbs()
         dst_addr = dst
         # if dst is node, we get its loopback addr
         if ':' not in dst:
-            dst_addr = self.get_loopback_addr(prefix_dbs, dst).split('/')[0]
+            dst_addr = self.get_loopback_addr(dst)
         try:
             IPAddress(dst_addr)
         except ValueError:
             print("node name or ip address not valid.")
             sys.exit(1)
 
-        adj_dbs = client.get_adj_dbs()
+        adj_dbs = self.client.get_adj_dbs()
         if2node = self.get_if2node_map(adj_dbs)
         fib_routes = defaultdict(list)
 
@@ -243,10 +287,14 @@ class PathCmd(DecisionCmd):
             if hop > max_hop:
                 return
 
-            cur_lpm_len = self.get_lpm_len_from_node(cur, dst_addr, prefix_dbs)
-            next_hop_nodes = self.get_nexthop_nodes(client.get_route_db(cur),
-                                                    dst_addr, cur_lpm_len, if2node,
-                                                    fib_routes, in_fib)
+            cur_lpm_len = self.get_lpm_len_from_node(cur, dst_addr)
+            next_hop_nodes = self.get_nexthop_nodes(
+                self.client.get_route_db(cur),
+                dst_addr,
+                cur_lpm_len,
+                if2node,
+                fib_routes,
+                in_fib)
 
             if len(next_hop_nodes) == 0:
                 if hop != 1:

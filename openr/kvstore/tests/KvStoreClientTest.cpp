@@ -37,13 +37,13 @@ const uint32_t kValueStrSize = 64;
 // max packet inter-arrival time (can't be chrono)
 const uint32_t kReqTimeoutMs = 4000;
 // interval for periodic syncs
-const chrono::seconds kSyncInterval(1);
+const std::chrono::seconds kSyncInterval(1);
 // maximum timeout for single request for sync
-const chrono::milliseconds kSyncReqTimeout(1000);
+const std::chrono::milliseconds kSyncReqTimeout(1000);
 // maximum timeout waiting for all peers to respond to sync request
-const chrono::milliseconds kSyncMaxWaitTime(1000);
+const std::chrono::milliseconds kSyncMaxWaitTime(1000);
 
-const std::chrono::milliseconds kTtl{100};
+const std::chrono::milliseconds kTtl{1000};
 } // namespace
 
 //
@@ -422,7 +422,7 @@ TEST(KvStoreClient, ApiTest) {
   evl.scheduleTimeout(std::chrono::milliseconds(2), [&]() noexcept {
     // 1st get key
     auto maybeVal1 = client2->getKey("test_key2");
-    ASSERT(maybeVal1);
+    ASSERT(maybeVal1.hasValue());
     EXPECT_EQ(1, maybeVal1->version);
     EXPECT_EQ("test_value2", maybeVal1->value);
 
@@ -431,7 +431,7 @@ TEST(KvStoreClient, ApiTest) {
 
     // 2nd getkey
     auto maybeVal2 = client2->getKey("test_key2");
-    ASSERT(maybeVal2);
+    ASSERT(maybeVal2.hasValue());
     EXPECT_EQ(2, maybeVal2->version);
     EXPECT_EQ("test_value2-client2", maybeVal2->value);
 
@@ -468,19 +468,19 @@ TEST(KvStoreClient, ApiTest) {
   evl.scheduleTimeout(std::chrono::milliseconds(4), [&]() noexcept {
     // dump keys
     const auto maybeKeyVals = client1->dumpAllWithPrefix();
-    ASSERT(maybeKeyVals);
+    ASSERT(maybeKeyVals.hasValue());
     ASSERT_EQ(3, maybeKeyVals->size());
     EXPECT_EQ("test_value1", maybeKeyVals->at("test_key1").value);
     EXPECT_EQ("test_value2-client2", maybeKeyVals->at("test_key2").value);
     EXPECT_EQ("set_test_value", maybeKeyVals->at("set_test_key").value);
 
     const auto maybeKeyVals2 = client2->dumpAllWithPrefix();
-    ASSERT(maybeKeyVals2);
+    ASSERT(maybeKeyVals2.hasValue());
     EXPECT_EQ(*maybeKeyVals, *maybeKeyVals2);
 
     // dump keys with a given prefix
     const auto maybePrefixedKeyVals = client1->dumpAllWithPrefix("test");
-    ASSERT(maybePrefixedKeyVals);
+    ASSERT(maybePrefixedKeyVals.hasValue());
     ASSERT_EQ(2, maybePrefixedKeyVals->size());
     EXPECT_EQ("test_value1", maybePrefixedKeyVals->at("test_key1").value);
     EXPECT_EQ(
@@ -641,9 +641,9 @@ TEST(KvStoreClient, SubscribeApiTest) {
     client2->persistKey("test_key2", "test_value2-client2");
   });
 
-  // Schedule timeout for terminating the even loop
+  // Schedule timeout for terminating the event loop
   evl.scheduleTimeout(
-      std::chrono::milliseconds(10), [&]() noexcept { evl.stop(); });
+      std::chrono::milliseconds(1000), [&]() noexcept { evl.stop(); });
 
   // Start the event loop
   std::thread evlThread([&]() {
